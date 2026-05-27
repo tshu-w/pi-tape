@@ -1,0 +1,17 @@
+{
+	"name": "pi-tape",
+	"version": "0.1.0",
+	"description": "Tape-style context management for pi sessions.",
+	"keywords": ["pi-package", "pi-extension", "context", "tape", "anchor"],
+	"license": "MIT",
+	"repository": "github:tshu-w/pi-tape",
+	"pi": {
+		"extensions": ["./extensions"]
+	},
+	"peerDependencies": {
+		"@earendil-works/pi-coding-agent": "*",
+		"@earendil-works/pi-agent-core": "*",
+		"@earendil-works/pi-ai": "*",
+		"typebox": "*"
+	}
+}
