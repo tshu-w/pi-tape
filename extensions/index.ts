@@ -354,6 +354,23 @@ function renderViewResults(anchors: Array<{ anchor: AnchorRecord; onBranch: bool
 	return `anchors (${anchors.length}/${total}, offset ${offset})\n${lines.join("\n")}`;
 }
 
+function renderCrossSessionView(anchors: AnchorRecord[], total: number, offset: number, scope: string, currentSessionFile?: string): string {
+	if (anchors.length === 0) return `No anchors found (scope: ${scope}).`;
+
+	const lines: string[] = [];
+	for (const a of anchors) {
+		if (lines.length > 0) lines.push("");
+		const date = a.timestamp?.slice(0, 10) ?? "";
+		const isCurrent = a.sessionFile === currentSessionFile;
+		const sessionLabel = isCurrent ? "(current)" : path.basename(a.sessionFile ?? "unknown").replace(".jsonl", "");
+		const summaryPreview = (a.summary.split("\n")[0] ?? "").slice(0, 100);
+		lines.push(`${a.name} [${a.entryId.slice(0, 8)}] ${date} \u2014 ${sessionLabel}`);
+		lines.push(`  ${summaryPreview}`);
+	}
+
+	return `anchors (${anchors.length}/${total}, offset ${offset}, scope ${scope})\n${lines.join("\n")}`;
+}
+
 function renderSearchResults(results: SearchResult[], total: number, offset: number, query: string, kinds: SearchKind[]): string {
 	const isDefaultKinds = kinds.length === DEFAULT_SEARCH_KINDS.length &&
 		kinds.every((k, i) => k === DEFAULT_SEARCH_KINDS[i]);
@@ -380,15 +397,15 @@ export default function (pi: ExtensionAPI) {
 			"anchor: create a semantic boundary with summary.",
 			"search: find old entries by keyword with optional kind filters.",
 			"info: show current tape boundary and context usage.",
-			"view: list anchors in this session.",
+			"view: list anchors (default: same cwd across sessions).",
 		].join(" "),
 		promptSnippet: "Manage semantic context with anchors and searchable history",
 		promptGuidelines: [
 			"Use tape(action='anchor', name=..., summary=...) when switching topics or after a major task completes.",
 			"When context usage is high, use tape(action='anchor') to checkpoint before continuing.",
+			"Use tape(action='view') to discover anchors from this or previous sessions.",
 			"Use tape(action='search', query=...) to recover old messages, tool results, or prior context when returning to an older topic.",
 			"Use tape(action='info') to check anchor count and context usage.",
-			"Use tape(action='view') only when the user asks to list or choose from existing anchors.",
 			"Prefer pi-style structured summaries: Goal, Constraints & Preferences, Progress, Key Decisions, Next Steps, Critical Context.",
 		],
 		parameters: Type.Object({
@@ -402,7 +419,7 @@ export default function (pi: ExtensionAPI) {
 				description: "Entry kinds to search. Default: message + tool_result.",
 			}))),
 			scope: Type.Optional(StringEnum(["branch", "session", "cwd", "all"] as const, {
-				description: "Search scope. Default: session for search.",
+				description: "Scope. Default: session for search, cwd for view.",
 			})),
 			limit: Type.Optional(Type.Number({ description: "Max results. Default: 20 for view, 10 for search." })),
 			offset: Type.Optional(Type.Number({ description: "Skip N results. Default: 0." })),
@@ -474,27 +491,56 @@ export default function (pi: ExtensionAPI) {
 
 				// ── view ────────────────────────────────────────
 				case "view": {
+					const scope = params.scope ?? "cwd";
 					const limit = Math.max(0, Math.trunc(params.limit ?? 20));
 					const offset = Math.max(0, Math.trunc(params.offset ?? 0));
-					const sessionAnchors = anchorsFromEntries(sessionEntries, sessionFile, ctx.cwd);
 
-					if (sessionAnchors.length === 0) {
-						return { content: [{ type: "text", text: "No anchors in this session." }], details: { anchors: 0 } };
+					if (scope === "branch" || scope === "session") {
+						const sessionAnchors = anchorsFromEntries(sessionEntries, sessionFile, ctx.cwd);
+						const currentBranchIds = new Set(branchEntries.map((e: any) => e.id));
+						let ordered: Array<{ anchor: AnchorRecord; onBranch: boolean }>;
+						if (scope === "branch") {
+							ordered = sessionAnchors
+								.filter((a) => currentBranchIds.has(a.entryId))
+								.reverse()
+								.map((a) => ({ anchor: a, onBranch: true }));
+						} else {
+							const onBranch = sessionAnchors.filter((a) => currentBranchIds.has(a.entryId)).reverse();
+							const offBranch = sessionAnchors.filter((a) => !currentBranchIds.has(a.entryId)).reverse();
+							ordered = [
+								...onBranch.map((a) => ({ anchor: a, onBranch: true })),
+								...offBranch.map((a) => ({ anchor: a, onBranch: false })),
+							];
+						}
+
+						if (ordered.length === 0) {
+							return { content: [{ type: "text", text: "No anchors found." }], details: { anchors: 0 } };
+						}
+
+						const shown = ordered.slice(offset, offset + limit);
+						return {
+							content: [{ type: "text", text: renderViewResults(shown, ordered.length, offset) }],
+							details: { total: ordered.length, shown: shown.length, offset, limit },
+						};
 					}
 
-					const currentBranchIds = new Set(branchEntries.map((e: any) => e.id));
-					const onBranch = sessionAnchors.filter((a) => currentBranchIds.has(a.entryId)).reverse();
-					const offBranch = sessionAnchors.filter((a) => !currentBranchIds.has(a.entryId)).reverse();
+					// cwd or all — scan session files
+					const allAnchors: AnchorRecord[] = [];
+					for (const item of listSessionFiles()) {
+						if (signal?.aborted) break;
+						const parsed = parseSessionFile(item.file);
+						if (!parsed) continue;
+						if (scope === "cwd" && parsed.cwd !== ctx.cwd) continue;
+						allAnchors.push(...anchorsFromEntries(parsed.entries, item.file, parsed.cwd));
+					}
 
-					const ordered = [
-						...onBranch.map((a) => ({ anchor: a, onBranch: true })),
-						...offBranch.map((a) => ({ anchor: a, onBranch: false })),
-					];
-					const shown = ordered.slice(offset, offset + limit);
+					allAnchors.sort((a, b) => (b.timestamp || "").localeCompare(a.timestamp || ""));
+					const total = allAnchors.length;
+					const page = allAnchors.slice(offset, offset + limit);
 
 					return {
-						content: [{ type: "text", text: renderViewResults(shown, sessionAnchors.length, offset) }],
-						details: { total: sessionAnchors.length, shown: shown.length, offset, limit },
+						content: [{ type: "text", text: renderCrossSessionView(page, total, offset, scope, sessionFile) }],
+						details: { total, shown: page.length, offset, limit, scope },
 					};
 				}
 

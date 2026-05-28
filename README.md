@@ -1,34 +1,23 @@
 # pi-tape
 
-Tape-style context construction for [pi](https://pi.dev), inspired by [Tape Systems](https://tape.systems/).
-
-`pi-tape` lets the agent create semantic anchors and lets future turns rebuild context from the latest anchor instead of inheriting all prior conversation.
-
-## Tools
-
-| Tool | Actions |
-|---|---|
-| `tape` | `anchor`, `search`, `info`, `view` |
-
-## Model
-
-An anchor is a semantic boundary with minimum inherited state:
-
-```ts
-{
-  name: string,
-  summary: string,
-}
-```
-
-On each LLM call, pi-tape finds the latest anchor and assembles context as:
-- Anchor summary (injected as conversation history summary)
-- Messages after that anchor
-
-Older history remains append-only in the session file and can be recovered with `tape(action='search')`.
+[Tape](https://tape.systems/)-style context management for [pi](https://pi.dev).
 
 ## Install
 
 ```bash
 pi install git:github.com/tshu-w/pi-tape
 ```
+
+## Implementation notes
+
+- Context is rebuilt from the latest anchor: summary is injected as conversation history, followed by a window of messages kept via pi's compact cut points.
+- `view` defaults to `scope='cwd'`, listing anchors across all sessions in the same working directory for cross-session discovery.
+
+## Tools
+
+| Action | Description |
+|---|---|
+| `anchor` | Create a semantic boundary with name and summary |
+| `view` | List anchors in current or other sessions |
+| `search` | Find old entries by keyword with optional kind filters |
+| `info` | Show current tape boundary and context usage |
