@@ -1,7 +1,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { StringEnum } from "@earendil-works/pi-ai";
-import { getAgentDir, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { findCutPoint, getAgentDir, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 
 // ============================================================================
@@ -227,20 +227,18 @@ function matchEntries(entries: any[], query: string): SearchResult[] {
 // ============================================================================
 
 function calculateFirstKeptEntryId(branchEntries: any[], keepRecentTokens: number): string | undefined {
-	let accumulated = 0;
-	let firstKeptId: string | undefined;
+	const cutPoint = findCutPoint(branchEntries, 0, branchEntries.length, keepRecentTokens);
+	return branchEntries[cutPoint.firstKeptEntryIndex]?.id;
+}
 
-	for (let i = branchEntries.length - 1; i >= 0; i--) {
-		const entry = branchEntries[i];
-		if (entry.type !== "message") continue;
-
-		const tokens = estimateMessageTokens(entry.message);
-		if (accumulated + tokens > keepRecentTokens && firstKeptId) break;
-		accumulated += tokens;
-		firstKeptId = entry.id;
-	}
-
-	return firstKeptId;
+function entriesFromMessages(messages: any[]): any[] {
+	return messages.map((message, index) => ({
+		type: "message",
+		id: `context-message-${index}`,
+		parentId: index > 0 ? `context-message-${index - 1}` : null,
+		timestamp: message?.timestamp ?? Date.now(),
+		message,
+	}));
 }
 
 // ============================================================================
@@ -489,15 +487,10 @@ export default function (pi: ExtensionAPI) {
 			anchorStartIdx = anchorIdx - 1;
 		}
 
-		// Calculate kept window before anchor
-		let keepFromIdx = anchorStartIdx;
-		let accumulated = 0;
-		for (let i = anchorStartIdx - 1; i >= 0; i--) {
-			const tokens = estimateMessageTokens(messages[i]);
-			if (accumulated + tokens > keepTokens) break;
-			accumulated += tokens;
-			keepFromIdx = i;
-		}
+		// Calculate a compact-compatible cut point before the anchor.
+		const entries = entriesFromMessages(messages);
+		const cutPoint = findCutPoint(entries, 0, anchorStartIdx, keepTokens);
+		const keepFromIdx = cutPoint.firstKeptEntryIndex;
 
 		// If everything fits, no need to trim
 		if (keepFromIdx === 0) return;
