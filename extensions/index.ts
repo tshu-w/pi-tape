@@ -10,6 +10,8 @@ import { Type } from "typebox";
 
 const DEFAULT_KEEP_RECENT_TOKENS = 20000;
 const SEARCH_PREVIEW_LENGTH = 200;
+const DEFAULT_SEARCH_KINDS = ["message", "tool_result"] as const;
+const SEARCH_KINDS = ["message", "tool_result", "tool_call", "anchor", "summary", "custom"] as const;
 
 // ============================================================================
 // Types
@@ -38,9 +40,18 @@ interface AnchorRecord {
 	sessionCwd?: string;
 }
 
+type SearchKind = (typeof SEARCH_KINDS)[number];
+
+interface SearchItem {
+	kind: SearchKind;
+	role: string;
+	content: string;
+}
+
 interface SearchResult {
 	entryId: string;
 	timestamp: string;
+	kinds: SearchKind[];
 	role: string;
 	preview: string;
 }
@@ -160,66 +171,119 @@ function estimateMessageTokens(msg: any): number {
 // Entry content extraction (for search)
 // ============================================================================
 
-function extractEntryContent(entry: any): { role: string; content: string } | null {
+function stringifyContentBlocks(content: any[]): string {
+	return content
+		.map((block: any) => {
+			if (typeof block === "string") return block;
+			if (block?.text) return block.text;
+			if (block?.thinking) return block.thinking;
+			return "";
+		})
+		.filter(Boolean)
+		.join(" ");
+}
+
+function extractSearchItems(entry: any): SearchItem[] {
 	if (entry.type === "message") {
 		const msg = entry.message;
-		if (!msg) return null;
+		if (!msg) return [];
+
+		if (isTapeAnchorMessage(msg)) {
+			const anchor = anchorFromMessage(msg);
+			return anchor ? [{ kind: "anchor", role: "anchor", content: anchor.summary }] : [];
+		}
+
+		if (msg.role === "toolResult") {
+			let content = "";
+			if (typeof msg.content === "string") {
+				content = msg.content;
+			} else if (Array.isArray(msg.content)) {
+				content = stringifyContentBlocks(msg.content);
+			}
+			const role = msg.toolName ? `toolResult:${msg.toolName}` : "toolResult";
+			return content ? [{ kind: "tool_result", role, content }] : [];
+		}
+
+		if (msg.role === "assistant") {
+			const items: SearchItem[] = [];
+			if (typeof msg.content === "string") {
+				if (msg.content) items.push({ kind: "message", role: "assistant", content: msg.content });
+			} else if (Array.isArray(msg.content)) {
+				const textContent = stringifyContentBlocks(msg.content);
+				if (textContent) items.push({ kind: "message", role: "assistant", content: textContent });
+
+				const toolCalls = msg.content
+					.filter((block: any) => block?.type === "toolCall")
+					.map((block: any) => `${block.name}(${JSON.stringify(block.arguments)})`)
+					.join(" ");
+				if (toolCalls) items.push({ kind: "tool_call", role: "assistant", content: toolCalls });
+			}
+			return items;
+		}
+
 		const role = msg.role ?? "unknown";
 		let content = "";
 		if (typeof msg.content === "string") {
 			content = msg.content;
 		} else if (Array.isArray(msg.content)) {
-			content = msg.content
-				.map((block: any) => {
-					if (typeof block === "string") return block;
-					if (block?.text) return block.text;
-					if (block?.thinking) return block.thinking;
-					if (block?.type === "toolCall") return `${block.name}(${JSON.stringify(block.arguments)})`;
-					return "";
-				})
-				.filter(Boolean)
-				.join(" ");
+			content = stringifyContentBlocks(msg.content);
 		}
 		if (msg.summary) content = msg.summary;
-		return content ? { role, content } : null;
+		return content ? [{ kind: "message", role, content }] : [];
 	}
 	if (entry.type === "custom_message" && typeof entry.content === "string" && entry.content) {
-		return { role: "custom", content: entry.content };
+		return [{ kind: "custom", role: "custom", content: entry.content }];
 	}
 	if (entry.type === "branch_summary" && entry.summary) {
-		return { role: "branchSummary", content: entry.summary };
+		return [{ kind: "summary", role: "branchSummary", content: entry.summary }];
 	}
 	if (entry.type === "compaction" && entry.summary) {
-		return { role: "compaction", content: entry.summary };
+		return [{ kind: "summary", role: "compaction", content: entry.summary }];
 	}
-	return null;
+	return [];
 }
 
-function matchEntries(entries: any[], query: string): SearchResult[] {
+function normalizeSearchKinds(kinds: unknown): SearchKind[] {
+	if (!Array.isArray(kinds) || kinds.length === 0) return [...DEFAULT_SEARCH_KINDS];
+	const allowed = new Set<string>(SEARCH_KINDS);
+	return kinds.filter((kind): kind is SearchKind => typeof kind === "string" && allowed.has(kind));
+}
+
+function matchEntries(entries: any[], query: string, kinds: SearchKind[]): SearchResult[] {
 	const lower = query.toLowerCase();
-	const results: SearchResult[] = [];
+	const allowedKinds = new Set<SearchKind>(kinds);
+	const resultMap = new Map<string, SearchResult>();
 
 	for (const entry of entries) {
-		const extracted = extractEntryContent(entry);
-		if (!extracted) continue;
-		if (!extracted.content.toLowerCase().includes(lower)) continue;
+		const entryId = entry.id ?? "";
+		for (const item of extractSearchItems(entry)) {
+			if (!allowedKinds.has(item.kind)) continue;
+			if (!item.content.toLowerCase().includes(lower)) continue;
 
-		const matchIdx = extracted.content.toLowerCase().indexOf(lower);
-		const start = Math.max(0, matchIdx - 50);
-		const end = Math.min(extracted.content.length, start + SEARCH_PREVIEW_LENGTH);
-		let preview = extracted.content.slice(start, end).replace(/\n/g, " ");
-		if (start > 0) preview = "..." + preview;
-		if (end < extracted.content.length) preview += "...";
+			const existing = resultMap.get(entryId);
+			if (existing) {
+				if (!existing.kinds.includes(item.kind)) existing.kinds.push(item.kind);
+				continue;
+			}
 
-		results.push({
-			entryId: entry.id ?? "",
-			timestamp: entry.timestamp ?? "",
-			role: extracted.role,
-			preview,
-		});
+			const matchIdx = item.content.toLowerCase().indexOf(lower);
+			const start = Math.max(0, matchIdx - 50);
+			const end = Math.min(item.content.length, start + SEARCH_PREVIEW_LENGTH);
+			let preview = item.content.slice(start, end).replace(/\n/g, " ");
+			if (start > 0) preview = "..." + preview;
+			if (end < item.content.length) preview += "...";
+
+			resultMap.set(entryId, {
+				entryId,
+				timestamp: entry.timestamp ?? "",
+				kinds: [item.kind],
+				role: item.role,
+				preview,
+			});
+		}
 	}
 
-	return results;
+	return Array.from(resultMap.values());
 }
 
 // ============================================================================
@@ -290,13 +354,17 @@ function renderViewResults(anchors: Array<{ anchor: AnchorRecord; onBranch: bool
 	return `anchors (${anchors.length}/${total}, offset ${offset})\n${lines.join("\n")}`;
 }
 
-function renderSearchResults(results: SearchResult[], total: number, offset: number, query: string): string {
-	if (results.length === 0) return `No entries matching "${query}" (offset ${offset}).`;
+function renderSearchResults(results: SearchResult[], total: number, offset: number, query: string, kinds: SearchKind[]): string {
+	const isDefaultKinds = kinds.length === DEFAULT_SEARCH_KINDS.length &&
+		kinds.every((k, i) => k === DEFAULT_SEARCH_KINDS[i]);
+	const kindSuffix = isDefaultKinds ? "" : ` kinds=${kinds.join(",")}`;
+	if (results.length === 0) return `No entries matching "${query}"${kindSuffix} (offset ${offset}).`;
 	const lines = results.map((r) => {
 		const date = r.timestamp?.slice(0, 10) ?? "";
-		return `- [${r.entryId.slice(0, 8)}] ${r.role} (${date})\n  ${r.preview}`;
+		const kindLabel = r.kinds.join(",");
+		return `- [${r.entryId.slice(0, 8)}] ${kindLabel}/${r.role} (${date})\n  ${r.preview}`;
 	});
-	return `search "${query}" (${results.length}/${total}, offset ${offset})\n${lines.join("\n\n")}`;
+	return `search "${query}"${kindSuffix} (${results.length}/${total}, offset ${offset})\n${lines.join("\n\n")}`;
 }
 
 // ============================================================================
@@ -310,7 +378,7 @@ export default function (pi: ExtensionAPI) {
 		description: [
 			"Tape-style context management.",
 			"anchor: create a semantic boundary with summary.",
-			"search: find old messages and entries by keyword.",
+			"search: find old entries by keyword with optional kind filters.",
 			"info: show current tape boundary and context usage.",
 			"view: list anchors in this session.",
 		].join(" "),
@@ -330,6 +398,9 @@ export default function (pi: ExtensionAPI) {
 			name: Type.Optional(Type.String({ description: "Anchor name (must be unique). Required for anchor." })),
 			summary: Type.Optional(Type.String({ description: "Retrospective state summary. Required for anchor." })),
 			query: Type.Optional(Type.String({ description: "Search keyword (case-insensitive). Required for search." })),
+			kinds: Type.Optional(Type.Array(StringEnum(SEARCH_KINDS, {
+				description: "Entry kinds to search. Default: message + tool_result.",
+			}))),
 			scope: Type.Optional(StringEnum(["branch", "session", "cwd", "all"] as const, {
 				description: "Search scope. Default: session for search.",
 			})),
@@ -433,15 +504,16 @@ export default function (pi: ExtensionAPI) {
 						return { content: [{ type: "text", text: "`query` is required for search." }], details: {} };
 					}
 					const scope = params.scope ?? "session";
+					const kinds = normalizeSearchKinds(params.kinds);
 					const limit = Math.max(0, Math.trunc(params.limit ?? 10));
 					const offset = Math.max(0, Math.trunc(params.offset ?? 0));
 
 					let allMatches: SearchResult[];
 
 					if (scope === "branch") {
-						allMatches = matchEntries(branchEntries, params.query);
+						allMatches = matchEntries(branchEntries, params.query, kinds);
 					} else if (scope === "session") {
-						allMatches = matchEntries(sessionEntries, params.query);
+						allMatches = matchEntries(sessionEntries, params.query, kinds);
 					} else {
 						allMatches = [];
 						for (const item of listSessionFiles()) {
@@ -449,7 +521,7 @@ export default function (pi: ExtensionAPI) {
 							const parsed = parseSessionFile(item.file);
 							if (!parsed) continue;
 							if (scope === "cwd" && parsed.cwd !== ctx.cwd) continue;
-							allMatches.push(...matchEntries(parsed.entries, params.query));
+							allMatches.push(...matchEntries(parsed.entries, params.query, kinds));
 						}
 					}
 
@@ -459,8 +531,8 @@ export default function (pi: ExtensionAPI) {
 					const page = allMatches.slice(offset, offset + limit);
 
 					return {
-						content: [{ type: "text", text: renderSearchResults(page, total, offset, params.query) }],
-						details: { results: page, total, scope, offset, limit },
+						content: [{ type: "text", text: renderSearchResults(page, total, offset, params.query, kinds) }],
+						details: { results: page, total, scope, kinds, offset, limit },
 					};
 				}
 
@@ -488,6 +560,7 @@ export default function (pi: ExtensionAPI) {
 		}
 
 		// Calculate a compact-compatible cut point before the anchor.
+		// This keeps the transcript valid by never starting from a toolResult.
 		const entries = entriesFromMessages(messages);
 		const cutPoint = findCutPoint(entries, 0, anchorStartIdx, keepTokens);
 		const keepFromIdx = cutPoint.firstKeptEntryIndex;
