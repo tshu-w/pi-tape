@@ -474,13 +474,18 @@ function matchEntries(entries: any[], query: QueryExpr, kinds: SearchKind[], tim
 }
 
 function recordDedupeKey(record: TapeRecord): string {
-	const source = record.kind === "anchor" ? record.sourceSessionFile ?? "" : record.sessionFile ?? "";
-	return `${record.kind}:${source}:${record.entryId}`;
+	if (record.kind === "anchor") {
+		return `${record.kind}:${record.sourceSessionFile ?? record.sessionFile ?? ""}:${record.entryId}`;
+	}
+	return `${record.kind}:${record.entryId}:${record.timestamp}:${record.summary}`;
 }
 
 function searchResultDedupeKey(result: SearchResult): string {
-	const source = result.kind === "anchor" ? result.sourceSessionFile ?? "" : result.sessionFile ?? "";
-	return `${result.kind}:${source}:${result.entryId}`;
+	if (result.kind === "anchor") {
+		return `${result.kind}:${result.sourceSessionFile ?? result.sessionFile ?? ""}:${result.entryId}`;
+	}
+	const summary = typeof result.payload.summary === "string" ? result.payload.summary : result.preview;
+	return `${result.kind}:${result.entryId}:${result.timestamp}:${summary}`;
 }
 
 function dedupeTapeRecords(records: TapeRecord[]): TapeRecord[] {
