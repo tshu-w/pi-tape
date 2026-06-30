@@ -13,6 +13,7 @@ pi install git:github.com/tshu-w/pi-tape
 - Context is rebuilt from the latest anchor: summary is injected as conversation history, followed by a window of messages kept via pi's compact cut points.
 - `view` defaults to `scope='cwd'`, listing anchors and compact records across all sessions in the same working directory for cross-session discovery.
 - Compact summaries appear in `view` and `search` as `compact/YYYYMMDD-HHMMSS` records, but they do not become context boundaries.
+- Date-only search filters cover whole local days: `start=YYYY-MM-DD` begins at 00:00:00 and `end=YYYY-MM-DD` ends at 23:59:59.999.
 
 ## Tools
 

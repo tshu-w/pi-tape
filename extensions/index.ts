@@ -43,6 +43,7 @@ interface TapeRecord {
 	timestamp: string;
 	sessionFile?: string;
 	sessionCwd?: string;
+	sourceSessionFile?: string;
 }
 
 type SearchKind = (typeof SEARCH_KINDS)[number];
@@ -62,6 +63,7 @@ interface SearchItem {
 	timestamp: string;
 	sessionFile?: string;
 	sessionCwd?: string;
+	sourceSessionFile?: string;
 }
 
 interface SearchResult {
@@ -73,6 +75,7 @@ interface SearchResult {
 	payload: Record<string, unknown>;
 	sessionFile?: string;
 	sessionCwd?: string;
+	sourceSessionFile?: string;
 }
 
 // ============================================================================
@@ -155,7 +158,12 @@ function timestampToMs(timestamp: string): number {
 function parseFilterTimestamp(value: unknown, name: string): { value?: number; error?: string } {
 	if (value == null) return {};
 	if (typeof value !== "string" || !value.trim()) return { error: `\`${name}\` must be a timestamp string.` };
-	const parsed = Date.parse(value);
+	const raw = value.trim();
+	const dateOnly = /^\d{4}-\d{2}-\d{2}$/.test(raw);
+	const timestamp = dateOnly
+		? `${raw}T${name === "end" ? "23:59:59.999" : "00:00:00.000"}`
+		: raw;
+	const parsed = Date.parse(timestamp);
 	if (Number.isNaN(parsed)) return { error: `\`${name}\` is not a valid timestamp: ${value}` };
 	return { value: parsed };
 }
@@ -213,6 +221,7 @@ function anchorFromEntry(entry: any, sessionFile?: string, sessionCwd?: string):
 		timestamp: normalizeTimestamp(entry.timestamp ?? anchor.createdAt),
 		sessionFile,
 		sessionCwd: sessionCwd ?? anchor.source?.cwd,
+		sourceSessionFile: anchor.source?.sessionFile,
 	};
 }
 
@@ -298,6 +307,7 @@ function recordPayload(record: TapeRecord): Record<string, unknown> {
 		summary: truncated.content,
 		sessionFile: record.sessionFile,
 		sessionCwd: record.sessionCwd,
+		sourceSessionFile: record.sourceSessionFile,
 		truncated: truncated.truncated,
 	};
 }
@@ -323,6 +333,7 @@ function searchItemForRecord(record: TapeRecord): SearchItem {
 		timestamp: record.timestamp,
 		sessionFile: record.sessionFile,
 		sessionCwd: record.sessionCwd,
+		sourceSessionFile: record.sourceSessionFile,
 	};
 }
 
@@ -453,12 +464,43 @@ function matchEntries(entries: any[], query: QueryExpr, kinds: SearchKind[], tim
 				payload: item.payload,
 				sessionFile: item.sessionFile,
 				sessionCwd: item.sessionCwd,
+				sourceSessionFile: item.sourceSessionFile,
 			});
 			break;
 		}
 	}
 
 	return results;
+}
+
+function recordDedupeKey(record: TapeRecord): string {
+	const source = record.kind === "anchor" ? record.sourceSessionFile ?? "" : record.sessionFile ?? "";
+	return `${record.kind}:${source}:${record.entryId}`;
+}
+
+function searchResultDedupeKey(result: SearchResult): string {
+	const source = result.kind === "anchor" ? result.sourceSessionFile ?? "" : result.sessionFile ?? "";
+	return `${result.kind}:${source}:${result.entryId}`;
+}
+
+function dedupeTapeRecords(records: TapeRecord[]): TapeRecord[] {
+	const seen = new Set<string>();
+	return records.filter((record) => {
+		const key = recordDedupeKey(record);
+		if (seen.has(key)) return false;
+		seen.add(key);
+		return true;
+	});
+}
+
+function dedupeSearchResults(results: SearchResult[]): SearchResult[] {
+	const seen = new Set<string>();
+	return results.filter((result) => {
+		const key = searchResultDedupeKey(result);
+		if (seen.has(key)) return false;
+		seen.add(key);
+		return true;
+	});
 }
 
 // ============================================================================
@@ -730,8 +772,9 @@ export default function (pi: ExtensionAPI) {
 					}
 
 					allRecords.sort((a, b) => (b.timestamp || "").localeCompare(a.timestamp || ""));
-					const total = allRecords.length;
-					const page = allRecords.slice(offset, offset + limit);
+					const dedupedRecords = dedupeTapeRecords(allRecords);
+					const total = dedupedRecords.length;
+					const page = dedupedRecords.slice(offset, offset + limit);
 
 					return {
 						content: [{ type: "text", text: renderCrossSessionView(page, total, offset, scope, sessionFile) }],
@@ -777,8 +820,9 @@ export default function (pi: ExtensionAPI) {
 
 					// Newest first
 					allMatches.sort((a, b) => (b.timestamp || "").localeCompare(a.timestamp || ""));
-					const total = allMatches.length;
-					const page = allMatches.slice(offset, offset + limit);
+					const dedupedMatches = dedupeSearchResults(allMatches);
+					const total = dedupedMatches.length;
+					const page = dedupedMatches.slice(offset, offset + limit);
 
 					return {
 						content: [{ type: "text", text: renderSearchResults(page, total, offset, query, kinds, timeFilterLabel) }],
