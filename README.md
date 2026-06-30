@@ -11,13 +11,14 @@ pi install git:github.com/tshu-w/pi-tape
 ## Implementation notes
 
 - Context is rebuilt from the latest anchor: summary is injected as conversation history, followed by a window of messages kept via pi's compact cut points.
-- `view` defaults to `scope='cwd'`, listing anchors across all sessions in the same working directory for cross-session discovery.
+- `view` defaults to `scope='cwd'`, listing anchors and compact records across all sessions in the same working directory for cross-session discovery.
+- Compact summaries appear in `view` and `search` as `compact/YYYYMMDD-HHMMSS` records, but they do not become context boundaries.
 
 ## Tools
 
 | Action | Description |
 |---|---|
 | `anchor` | Create a semantic boundary with name and summary |
-| `view` | List anchors in current or other sessions |
-| `search` | Find old entries by keyword with optional kind filters |
+| `view` | List anchors and compact records in current or other sessions |
+| `search` | Find old entries by query, kind, and timestamp filters |
 | `info` | Show current tape boundary and context usage |

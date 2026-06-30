@@ -1,7 +1,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { StringEnum } from "@earendil-works/pi-ai";
-import { findCutPoint, getAgentDir, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, findCutPoint, getAgentDir, truncateHead, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 
 // ============================================================================
@@ -11,7 +11,9 @@ import { Type } from "typebox";
 const DEFAULT_KEEP_RECENT_TOKENS = 20000;
 const SEARCH_PREVIEW_LENGTH = 200;
 const DEFAULT_SEARCH_KINDS = ["message", "tool_result"] as const;
-const SEARCH_KINDS = ["message", "tool_result", "tool_call", "anchor", "summary", "custom"] as const;
+const SEARCH_KINDS = ["message", "tool_result", "tool_call", "anchor", "compact", "summary", "custom"] as const;
+const SEARCH_KINDS_SET = new Set<string>(SEARCH_KINDS);
+const DEFAULT_SEARCH_KINDS_SET = new Set<string>(DEFAULT_SEARCH_KINDS);
 
 // ============================================================================
 // Types
@@ -31,7 +33,10 @@ interface TapeAnchorData {
 	};
 }
 
-interface AnchorRecord {
+type TapeRecordKind = "anchor" | "compact";
+
+interface TapeRecord {
+	kind: TapeRecordKind;
 	entryId: string;
 	name: string;
 	summary: string;
@@ -42,18 +47,32 @@ interface AnchorRecord {
 
 type SearchKind = (typeof SEARCH_KINDS)[number];
 
+type QueryExpr = string[][];
+
+interface TimeFilter {
+	start?: number;
+	end?: number;
+}
+
 interface SearchItem {
 	kind: SearchKind;
 	role: string;
-	content: string;
+	searchableText: string;
+	payload: Record<string, unknown>;
+	timestamp: string;
+	sessionFile?: string;
+	sessionCwd?: string;
 }
 
 interface SearchResult {
 	entryId: string;
 	timestamp: string;
-	kinds: SearchKind[];
+	kind: SearchKind;
 	role: string;
 	preview: string;
+	payload: Record<string, unknown>;
+	sessionFile?: string;
+	sessionCwd?: string;
 }
 
 // ============================================================================
@@ -69,11 +88,9 @@ function listSessionFiles(): Array<{ file: string; mtime: number }> {
 	if (!fs.existsSync(sessionsDir)) return [];
 
 	const files: Array<{ file: string; mtime: number }> = [];
-	for (const subdir of fs.readdirSync(sessionsDir)) {
-		const subdirPath = path.join(sessionsDir, subdir);
-		let stat: fs.Stats;
-		try { stat = fs.statSync(subdirPath); } catch { continue; }
-		if (!stat.isDirectory()) continue;
+	for (const dirent of fs.readdirSync(sessionsDir, { withFileTypes: true })) {
+		if (!dirent.isDirectory()) continue;
+		const subdirPath = path.join(sessionsDir, dirent.name);
 
 		for (const name of fs.readdirSync(subdirPath)) {
 			if (!name.endsWith(".jsonl")) continue;
@@ -106,8 +123,70 @@ function parseSessionFile(file: string): { cwd?: string; entries: any[] } | null
 	return { cwd, entries };
 }
 
+function resolvedFilePath(file: string): string {
+	try { return fs.realpathSync.native(file); } catch { return path.resolve(file); }
+}
+
+function isCurrentSessionFile(file: string, sessionFile?: string): boolean {
+	return !!sessionFile && resolvedFilePath(file) === resolvedFilePath(sessionFile);
+}
+
+function sessionEntriesForScan(item: { file: string }, sessionFile: string | undefined, sessionEntries: any[], cwd: string): { file: string; cwd?: string; entries: any[] } | null {
+	if (isCurrentSessionFile(item.file, sessionFile)) return { file: sessionFile!, cwd, entries: sessionEntries };
+	const parsed = parseSessionFile(item.file);
+	return parsed ? { file: item.file, ...parsed } : null;
+}
+
 // ============================================================================
-// Anchor detection & extraction
+// Timestamp helpers
+// ============================================================================
+
+function normalizeTimestamp(timestamp: unknown): string {
+	if (typeof timestamp === "string") return timestamp;
+	if (typeof timestamp === "number") return new Date(timestamp).toISOString();
+	return "";
+}
+
+function timestampToMs(timestamp: string): number {
+	if (!timestamp) return Number.NaN;
+	return Date.parse(timestamp);
+}
+
+function parseFilterTimestamp(value: unknown, name: string): { value?: number; error?: string } {
+	if (value == null) return {};
+	if (typeof value !== "string" || !value.trim()) return { error: `\`${name}\` must be a timestamp string.` };
+	const parsed = Date.parse(value);
+	if (Number.isNaN(parsed)) return { error: `\`${name}\` is not a valid timestamp: ${value}` };
+	return { value: parsed };
+}
+
+function matchesTimeFilter(timestamp: string, filter: TimeFilter): boolean {
+	if (filter.start == null && filter.end == null) return true;
+	const ms = timestampToMs(timestamp);
+	if (Number.isNaN(ms)) return false;
+	if (filter.start != null && ms < filter.start) return false;
+	if (filter.end != null && ms > filter.end) return false;
+	return true;
+}
+
+function formatTimestampSecond(timestamp: string): string {
+	const raw = normalizeTimestamp(timestamp);
+	const match = raw.match(/^(\d{4}-\d{2}-\d{2})T(\d{2}:\d{2}:\d{2})/);
+	if (match) return `${match[1]} ${match[2]}`;
+	const ms = Date.parse(raw);
+	if (!Number.isNaN(ms)) return new Date(ms).toISOString().slice(0, 19).replace("T", " ");
+	return raw.slice(0, 19);
+}
+
+function compactNameFromTimestamp(timestamp: string): string {
+	const display = formatTimestampSecond(timestamp);
+	const match = display.match(/^(\d{4})-(\d{2})-(\d{2}) (\d{2}):(\d{2}):(\d{2})$/);
+	if (match) return `compact/${match[1]}${match[2]}${match[3]}-${match[4]}${match[5]}${match[6]}`;
+	return `compact/${display.replace(/[^0-9]/g, "").slice(0, 15)}`;
+}
+
+// ============================================================================
+// Anchor detection & record extraction
 // ============================================================================
 
 function isTapeAnchorMessage(message: any): boolean {
@@ -120,29 +199,58 @@ function anchorFromMessage(message: any): TapeAnchorData | null {
 	return data as TapeAnchorData;
 }
 
-function anchorFromEntry(entry: any, sessionFile?: string, sessionCwd?: string): AnchorRecord | null {
+function anchorFromEntry(entry: any, sessionFile?: string, sessionCwd?: string): TapeRecord | null {
 	if (entry?.type !== "message" || !isTapeAnchorMessage(entry.message)) return null;
 
 	const anchor = anchorFromMessage(entry.message);
 	if (!anchor) return null;
 
 	return {
+		kind: "anchor",
 		entryId: entry.id,
 		name: anchor.name,
 		summary: anchor.summary,
-		timestamp: entry.timestamp ?? anchor.createdAt,
+		timestamp: normalizeTimestamp(entry.timestamp ?? anchor.createdAt),
 		sessionFile,
 		sessionCwd: sessionCwd ?? anchor.source?.cwd,
 	};
 }
 
-function anchorsFromEntries(entries: any[], sessionFile?: string, sessionCwd?: string): AnchorRecord[] {
-	const anchors: AnchorRecord[] = [];
+function compactFromEntry(entry: any, sessionFile?: string, sessionCwd?: string): TapeRecord | null {
+	if (entry?.type !== "compaction" || !entry.summary) return null;
+	const timestamp = normalizeTimestamp(entry.timestamp);
+	return {
+		kind: "compact",
+		entryId: entry.id,
+		name: compactNameFromTimestamp(timestamp),
+		summary: entry.summary,
+		timestamp,
+		sessionFile,
+		sessionCwd,
+	};
+}
+
+function anchorRecordsFromEntries(entries: any[], sessionFile?: string, sessionCwd?: string): TapeRecord[] {
+	const anchors: TapeRecord[] = [];
 	for (const entry of entries) {
 		const anchor = anchorFromEntry(entry, sessionFile, sessionCwd);
 		if (anchor) anchors.push(anchor);
 	}
 	return anchors;
+}
+
+function tapeRecordsFromEntries(entries: any[], sessionFile?: string, sessionCwd?: string): TapeRecord[] {
+	const records: TapeRecord[] = [];
+	for (const entry of entries) {
+		const anchor = anchorFromEntry(entry, sessionFile, sessionCwd);
+		if (anchor) {
+			records.push(anchor);
+			continue;
+		}
+		const compact = compactFromEntry(entry, sessionFile, sessionCwd);
+		if (compact) records.push(compact);
+	}
+	return records;
 }
 
 // ============================================================================
@@ -171,6 +279,29 @@ function estimateMessageTokens(msg: any): number {
 // Entry content extraction (for search)
 // ============================================================================
 
+function truncateSearchText(text: string): { content: string; truncated: boolean } {
+	const truncation = truncateHead(text, { maxLines: DEFAULT_MAX_LINES, maxBytes: DEFAULT_MAX_BYTES });
+	return { content: truncation.content, truncated: truncation.truncated };
+}
+
+function contentPayload(content: string): Record<string, unknown> {
+	const truncated = truncateSearchText(content);
+	return { content: truncated.content, truncated: truncated.truncated };
+}
+
+function recordPayload(record: TapeRecord): Record<string, unknown> {
+	const truncated = truncateSearchText(record.summary);
+	return {
+		entryId: record.entryId,
+		timestamp: record.timestamp,
+		name: record.name,
+		summary: truncated.content,
+		sessionFile: record.sessionFile,
+		sessionCwd: record.sessionCwd,
+		truncated: truncated.truncated,
+	};
+}
+
 function stringifyContentBlocks(content: any[]): string {
 	return content
 		.map((block: any) => {
@@ -183,15 +314,29 @@ function stringifyContentBlocks(content: any[]): string {
 		.join(" ");
 }
 
-function extractSearchItems(entry: any): SearchItem[] {
+function searchItemForRecord(record: TapeRecord): SearchItem {
+	return {
+		kind: record.kind,
+		role: record.kind,
+		searchableText: `${record.name}\n${record.summary}`,
+		payload: recordPayload(record),
+		timestamp: record.timestamp,
+		sessionFile: record.sessionFile,
+		sessionCwd: record.sessionCwd,
+	};
+}
+
+function extractSearchItems(entry: any, sessionFile?: string, sessionCwd?: string): SearchItem[] {
+	const anchor = anchorFromEntry(entry, sessionFile, sessionCwd);
+	if (anchor) return [searchItemForRecord(anchor)];
+
+	const compact = compactFromEntry(entry, sessionFile, sessionCwd);
+	if (compact) return [searchItemForRecord(compact)];
+
+	const timestamp = normalizeTimestamp(entry.timestamp);
 	if (entry.type === "message") {
 		const msg = entry.message;
 		if (!msg) return [];
-
-		if (isTapeAnchorMessage(msg)) {
-			const anchor = anchorFromMessage(msg);
-			return anchor ? [{ kind: "anchor", role: "anchor", content: anchor.summary }] : [];
-		}
 
 		if (msg.role === "toolResult") {
 			let content = "";
@@ -201,22 +346,22 @@ function extractSearchItems(entry: any): SearchItem[] {
 				content = stringifyContentBlocks(msg.content);
 			}
 			const role = msg.toolName ? `toolResult:${msg.toolName}` : "toolResult";
-			return content ? [{ kind: "tool_result", role, content }] : [];
+			return content ? [{ kind: "tool_result", role, searchableText: content, payload: contentPayload(content), timestamp, sessionFile, sessionCwd }] : [];
 		}
 
 		if (msg.role === "assistant") {
 			const items: SearchItem[] = [];
 			if (typeof msg.content === "string") {
-				if (msg.content) items.push({ kind: "message", role: "assistant", content: msg.content });
+				if (msg.content) items.push({ kind: "message", role: "assistant", searchableText: msg.content, payload: contentPayload(msg.content), timestamp, sessionFile, sessionCwd });
 			} else if (Array.isArray(msg.content)) {
 				const textContent = stringifyContentBlocks(msg.content);
-				if (textContent) items.push({ kind: "message", role: "assistant", content: textContent });
+				if (textContent) items.push({ kind: "message", role: "assistant", searchableText: textContent, payload: contentPayload(textContent), timestamp, sessionFile, sessionCwd });
 
 				const toolCalls = msg.content
 					.filter((block: any) => block?.type === "toolCall")
 					.map((block: any) => `${block.name}(${JSON.stringify(block.arguments)})`)
 					.join(" ");
-				if (toolCalls) items.push({ kind: "tool_call", role: "assistant", content: toolCalls });
+				if (toolCalls) items.push({ kind: "tool_call", role: "assistant", searchableText: toolCalls, payload: contentPayload(toolCalls), timestamp, sessionFile, sessionCwd });
 			}
 			return items;
 		}
@@ -229,61 +374,91 @@ function extractSearchItems(entry: any): SearchItem[] {
 			content = stringifyContentBlocks(msg.content);
 		}
 		if (msg.summary) content = msg.summary;
-		return content ? [{ kind: "message", role, content }] : [];
+		return content ? [{ kind: "message", role, searchableText: content, payload: contentPayload(content), timestamp, sessionFile, sessionCwd }] : [];
 	}
 	if (entry.type === "custom_message" && typeof entry.content === "string" && entry.content) {
-		return [{ kind: "custom", role: "custom", content: entry.content }];
+		return [{ kind: "custom", role: "custom", searchableText: entry.content, payload: contentPayload(entry.content), timestamp, sessionFile, sessionCwd }];
 	}
 	if (entry.type === "branch_summary" && entry.summary) {
-		return [{ kind: "summary", role: "branchSummary", content: entry.summary }];
-	}
-	if (entry.type === "compaction" && entry.summary) {
-		return [{ kind: "summary", role: "compaction", content: entry.summary }];
+		return [{ kind: "summary", role: "branchSummary", searchableText: entry.summary, payload: contentPayload(entry.summary), timestamp, sessionFile, sessionCwd }];
 	}
 	return [];
 }
 
 function normalizeSearchKinds(kinds: unknown): SearchKind[] {
 	if (!Array.isArray(kinds) || kinds.length === 0) return [...DEFAULT_SEARCH_KINDS];
-	const allowed = new Set<string>(SEARCH_KINDS);
-	return kinds.filter((kind): kind is SearchKind => typeof kind === "string" && allowed.has(kind));
+	const normalized: SearchKind[] = [];
+	const seen = new Set<SearchKind>();
+	for (const kind of kinds) {
+		if (typeof kind !== "string" || !SEARCH_KINDS_SET.has(kind)) continue;
+		const searchKind = kind as SearchKind;
+		if (seen.has(searchKind)) continue;
+		seen.add(searchKind);
+		normalized.push(searchKind);
+	}
+	return normalized;
 }
 
-function matchEntries(entries: any[], query: string, kinds: SearchKind[]): SearchResult[] {
-	const lower = query.toLowerCase();
+function parseQuery(query: string): QueryExpr {
+	return query
+		.toLowerCase()
+		.split("|")
+		.map((part) => part.trim().split(/\s+/).filter(Boolean))
+		.filter((part) => part.length > 0);
+}
+
+function matchingQueryTerm(content: string, query: QueryExpr): string | undefined {
+	const lower = content.toLowerCase();
+	for (const andTerms of query) {
+		if (!andTerms.every((term) => lower.includes(term))) continue;
+		return andTerms.find((term) => lower.includes(term));
+	}
+	return undefined;
+}
+
+function matchesQuery(text: string, query: QueryExpr): boolean {
+	if (query.length === 0) return true;
+	return matchingQueryTerm(text, query) !== undefined;
+}
+
+function makePreview(content: string, query: QueryExpr): string {
+	const term = matchingQueryTerm(content, query);
+	const lower = content.toLowerCase();
+	const matchIdx = term ? lower.indexOf(term) : 0;
+	const start = Math.max(0, matchIdx - 50);
+	const end = Math.min(content.length, start + SEARCH_PREVIEW_LENGTH);
+	let preview = content.slice(start, end).replace(/\n/g, " ");
+	if (start > 0) preview = "..." + preview;
+	if (end < content.length) preview += "...";
+	return preview;
+}
+
+function matchEntries(entries: any[], query: QueryExpr, kinds: SearchKind[], timeFilter: TimeFilter, sessionFile?: string, sessionCwd?: string): SearchResult[] {
 	const allowedKinds = new Set<SearchKind>(kinds);
-	const resultMap = new Map<string, SearchResult>();
+	const results: SearchResult[] = [];
 
 	for (const entry of entries) {
 		const entryId = entry.id ?? "";
-		for (const item of extractSearchItems(entry)) {
+		for (const item of extractSearchItems(entry, sessionFile, sessionCwd)) {
 			if (!allowedKinds.has(item.kind)) continue;
-			if (!item.content.toLowerCase().includes(lower)) continue;
+			if (!matchesTimeFilter(item.timestamp, timeFilter)) continue;
+			if (!matchesQuery(item.searchableText, query)) continue;
 
-			const existing = resultMap.get(entryId);
-			if (existing) {
-				if (!existing.kinds.includes(item.kind)) existing.kinds.push(item.kind);
-				continue;
-			}
-
-			const matchIdx = item.content.toLowerCase().indexOf(lower);
-			const start = Math.max(0, matchIdx - 50);
-			const end = Math.min(item.content.length, start + SEARCH_PREVIEW_LENGTH);
-			let preview = item.content.slice(start, end).replace(/\n/g, " ");
-			if (start > 0) preview = "..." + preview;
-			if (end < item.content.length) preview += "...";
-
-			resultMap.set(entryId, {
+			results.push({
 				entryId,
-				timestamp: entry.timestamp ?? "",
-				kinds: [item.kind],
+				timestamp: item.timestamp,
+				kind: item.kind,
 				role: item.role,
-				preview,
+				preview: makePreview(item.searchableText, query),
+				payload: item.payload,
+				sessionFile: item.sessionFile,
+				sessionCwd: item.sessionCwd,
 			});
+			break;
 		}
 	}
 
-	return Array.from(resultMap.values());
+	return results;
 }
 
 // ============================================================================
@@ -292,7 +467,14 @@ function matchEntries(entries: any[], query: string, kinds: SearchKind[]): Searc
 
 function calculateFirstKeptEntryId(branchEntries: any[], keepRecentTokens: number): string | undefined {
 	const cutPoint = findCutPoint(branchEntries, 0, branchEntries.length, keepRecentTokens);
-	return branchEntries[cutPoint.firstKeptEntryIndex]?.id;
+	const keepFromIdx = cutPoint.isSplitTurn && cutPoint.turnStartIndex >= 0
+		? cutPoint.turnStartIndex
+		: cutPoint.firstKeptEntryIndex;
+	for (let i = keepFromIdx; i < branchEntries.length; i++) {
+		const entry = branchEntries[i];
+		if (entry?.type === "message") return entry.id;
+	}
+	return undefined;
 }
 
 function entriesFromMessages(messages: any[]): any[] {
@@ -323,7 +505,7 @@ function makeSummaryMessage(anchor: TapeAnchorData): any {
 		customType: "tape-summary",
 		content: `[Previous conversation summary — ${anchor.name}]\n\n${anchor.summary}`,
 		display: true,
-		timestamp: Date.now(),
+		timestamp: new Date(anchor.createdAt).getTime(),
 	};
 }
 
@@ -331,13 +513,31 @@ function makeSummaryMessage(anchor: TapeAnchorData): any {
 // Rendering
 // ============================================================================
 
-function renderViewResults(anchors: Array<{ anchor: AnchorRecord; onBranch: boolean }>, total: number, offset: number): string {
-	if (anchors.length === 0) return "No anchors in this session.";
+function firstSummaryLine(summary: string): string {
+	return (summary.split("\n")[0] ?? "").slice(0, 100);
+}
+
+function sessionLabel(record: TapeRecord | SearchResult, currentSessionFile?: string): string {
+	if (currentSessionFile && record.sessionFile === currentSessionFile) return "(current)";
+	return path.basename(record.sessionFile ?? "unknown").replace(".jsonl", "");
+}
+
+function renderRecordRow(r: TapeRecord, currentSessionFile: string | undefined, indent = ""): string[] {
+	return [
+		`${indent}${r.name} [${r.entryId.slice(0, 8)}] ${formatTimestampSecond(r.timestamp)} — ${sessionLabel(r, currentSessionFile)}`,
+		`${indent}  ${firstSummaryLine(r.summary)}`,
+	];
+}
+
+function renderViewResults(records: Array<{ record: TapeRecord; onBranch: boolean }>, total: number, offset: number, currentSessionFile?: string): string {
+	if (records.length === 0) {
+		return total > 0 ? `No records at offset ${offset} (total ${total}).` : "No records in this session.";
+	}
 
 	const lines: string[] = [];
 	let inOffBranch = false;
-	for (const item of anchors) {
-		const a = item.anchor;
+	for (const item of records) {
+		const r = item.record;
 		if (!item.onBranch && !inOffBranch) {
 			if (lines.length > 0) lines.push("");
 			lines.push("off-branch:");
@@ -345,43 +545,36 @@ function renderViewResults(anchors: Array<{ anchor: AnchorRecord; onBranch: bool
 		} else if (lines.length > 0) {
 			lines.push("");
 		}
-		const indent = item.onBranch ? "" : "  ";
-		const summaryPreview = (a.summary.split("\n")[0] ?? "").slice(0, 100);
-		lines.push(`${indent}${a.name} [${a.entryId.slice(0, 8)}]`);
-		lines.push(`${indent}  ${summaryPreview}`);
+		lines.push(...renderRecordRow(r, currentSessionFile, item.onBranch ? "" : "  "));
 	}
 
-	return `anchors (${anchors.length}/${total}, offset ${offset})\n${lines.join("\n")}`;
+	return `records (${records.length}/${total}, offset ${offset})\n${lines.join("\n")}`;
 }
 
-function renderCrossSessionView(anchors: AnchorRecord[], total: number, offset: number, scope: string, currentSessionFile?: string): string {
-	if (anchors.length === 0) return `No anchors found (scope: ${scope}).`;
+function renderCrossSessionView(records: TapeRecord[], total: number, offset: number, scope: string, currentSessionFile?: string): string {
+	if (records.length === 0) {
+		return total > 0 ? `No records at offset ${offset} (total ${total}, scope ${scope}).` : `No records found (scope: ${scope}).`;
+	}
 
 	const lines: string[] = [];
-	for (const a of anchors) {
+	for (const r of records) {
 		if (lines.length > 0) lines.push("");
-		const date = a.timestamp?.slice(0, 10) ?? "";
-		const isCurrent = a.sessionFile === currentSessionFile;
-		const sessionLabel = isCurrent ? "(current)" : path.basename(a.sessionFile ?? "unknown").replace(".jsonl", "");
-		const summaryPreview = (a.summary.split("\n")[0] ?? "").slice(0, 100);
-		lines.push(`${a.name} [${a.entryId.slice(0, 8)}] ${date} \u2014 ${sessionLabel}`);
-		lines.push(`  ${summaryPreview}`);
+		lines.push(...renderRecordRow(r, currentSessionFile));
 	}
 
-	return `anchors (${anchors.length}/${total}, offset ${offset}, scope ${scope})\n${lines.join("\n")}`;
+	return `records (${records.length}/${total}, offset ${offset}, scope ${scope})\n${lines.join("\n")}`;
 }
 
-function renderSearchResults(results: SearchResult[], total: number, offset: number, query: string, kinds: SearchKind[]): string {
-	const isDefaultKinds = kinds.length === DEFAULT_SEARCH_KINDS.length &&
-		kinds.every((k, i) => k === DEFAULT_SEARCH_KINDS[i]);
+function renderSearchResults(results: SearchResult[], total: number, offset: number, query: string, kinds: SearchKind[], timeFilterLabel: string): string {
+	const isDefaultKinds = kinds.length === DEFAULT_SEARCH_KINDS_SET.size && kinds.every((k) => DEFAULT_SEARCH_KINDS_SET.has(k));
 	const kindSuffix = isDefaultKinds ? "" : ` kinds=${kinds.join(",")}`;
-	if (results.length === 0) return `No entries matching "${query}"${kindSuffix} (offset ${offset}).`;
+	const queryLabel = query ? `"${query}"` : "<all>";
+	const suffix = `${kindSuffix}${timeFilterLabel}`;
+	if (results.length === 0) return `No entries matching ${queryLabel}${suffix} (offset ${offset}).`;
 	const lines = results.map((r) => {
-		const date = r.timestamp?.slice(0, 10) ?? "";
-		const kindLabel = r.kinds.join(",");
-		return `- [${r.entryId.slice(0, 8)}] ${kindLabel}/${r.role} (${date})\n  ${r.preview}`;
+		return `- [${r.entryId.slice(0, 8)}] ${r.kind}/${r.role} (${formatTimestampSecond(r.timestamp)})\n  ${r.preview}`;
 	});
-	return `search "${query}"${kindSuffix} (${results.length}/${total}, offset ${offset})\n${lines.join("\n\n")}`;
+	return `search ${queryLabel}${suffix} (${results.length}/${total}, offset ${offset})\n${lines.join("\n\n")}`;
 }
 
 // ============================================================================
@@ -395,15 +588,15 @@ export default function (pi: ExtensionAPI) {
 		description: [
 			"Tape-style context management.",
 			"anchor: create a semantic boundary with summary.",
-			"search: find old entries by keyword with optional kind filters.",
+			"search: find old entries by keyword with optional kind and time filters.",
 			"info: show current tape boundary and context usage.",
-			"view: list anchors (default: same cwd across sessions).",
+			"view: list anchors and compact records (default: same cwd across sessions).",
 		].join(" "),
 		promptSnippet: "Manage semantic context with anchors and searchable history",
 		promptGuidelines: [
 			"Use tape(action='anchor', name=..., summary=...) when switching topics or after a major task completes.",
 			"When context usage is high, use tape(action='anchor') to checkpoint before continuing.",
-			"Use tape(action='view') to discover anchors from this or previous sessions.",
+			"Use tape(action='view') to discover anchors and compact records from this or previous sessions.",
 			"Use tape(action='search', query=...) to recover old messages, tool results, or prior context when returning to an older topic.",
 			"Use tape(action='info') to check anchor count and context usage.",
 			"Prefer pi-style structured summaries: Goal, Constraints & Preferences, Progress, Key Decisions, Next Steps, Critical Context.",
@@ -414,7 +607,9 @@ export default function (pi: ExtensionAPI) {
 			}),
 			name: Type.Optional(Type.String({ description: "Anchor name (must be unique). Required for anchor." })),
 			summary: Type.Optional(Type.String({ description: "Retrospective state summary. Required for anchor." })),
-			query: Type.Optional(Type.String({ description: "Search keyword (case-insensitive). Required for search." })),
+			query: Type.Optional(Type.String({ description: "Search query. Space means AND; | means OR. Optional when start/end is set." })),
+			start: Type.Optional(Type.String({ description: "Inclusive timestamp lower bound for search." })),
+			end: Type.Optional(Type.String({ description: "Inclusive timestamp upper bound for search." })),
 			kinds: Type.Optional(Type.Array(StringEnum(SEARCH_KINDS, {
 				description: "Entry kinds to search. Default: message + tool_result.",
 			}))),
@@ -428,12 +623,12 @@ export default function (pi: ExtensionAPI) {
 			const branchEntries = ctx.sessionManager.getBranch() as any[];
 			const sessionEntries = ctx.sessionManager.getEntries() as any[];
 			const sessionFile = ctx.sessionManager.getSessionFile();
-			const currentBranchAnchors = anchorsFromEntries(branchEntries, sessionFile, ctx.cwd);
+			const currentBranchAnchors = anchorRecordsFromEntries(branchEntries, sessionFile, ctx.cwd);
 
 			switch (params.action) {
 				// ── info ─────────────────────────────────────────
 				case "info": {
-					const sessionAnchors = anchorsFromEntries(sessionEntries, sessionFile, ctx.cwd);
+					const sessionAnchors = anchorRecordsFromEntries(sessionEntries, sessionFile, ctx.cwd);
 					const latest = currentBranchAnchors.at(-1);
 					const usage = ctx.getContextUsage?.();
 					const lines = [
@@ -460,6 +655,9 @@ export default function (pi: ExtensionAPI) {
 				case "anchor": {
 					if (!params.name || !params.summary) {
 						return { content: [{ type: "text", text: "`name` and `summary` are required for anchor." }], details: {} };
+					}
+					if (params.name.startsWith("compact/")) {
+						return { content: [{ type: "text", text: "Anchor names starting with `compact/` are reserved for compact records." }], details: {} };
 					}
 					const existing = currentBranchAnchors.find((a) => a.name === params.name);
 					if (existing) {
@@ -496,47 +694,44 @@ export default function (pi: ExtensionAPI) {
 					const offset = Math.max(0, Math.trunc(params.offset ?? 0));
 
 					if (scope === "branch" || scope === "session") {
-						const sessionAnchors = anchorsFromEntries(sessionEntries, sessionFile, ctx.cwd);
+						const sessionRecords = tapeRecordsFromEntries(sessionEntries, sessionFile, ctx.cwd);
 						const currentBranchIds = new Set(branchEntries.map((e: any) => e.id));
-						let ordered: Array<{ anchor: AnchorRecord; onBranch: boolean }>;
+						const onBranch = sessionRecords.filter((a) => currentBranchIds.has(a.entryId)).reverse();
+						let ordered: Array<{ record: TapeRecord; onBranch: boolean }>;
 						if (scope === "branch") {
-							ordered = sessionAnchors
-								.filter((a) => currentBranchIds.has(a.entryId))
-								.reverse()
-								.map((a) => ({ anchor: a, onBranch: true }));
+							ordered = onBranch.map((record) => ({ record, onBranch: true }));
 						} else {
-							const onBranch = sessionAnchors.filter((a) => currentBranchIds.has(a.entryId)).reverse();
-							const offBranch = sessionAnchors.filter((a) => !currentBranchIds.has(a.entryId)).reverse();
+							const offBranch = sessionRecords.filter((a) => !currentBranchIds.has(a.entryId)).reverse();
 							ordered = [
-								...onBranch.map((a) => ({ anchor: a, onBranch: true })),
-								...offBranch.map((a) => ({ anchor: a, onBranch: false })),
+								...onBranch.map((record) => ({ record, onBranch: true })),
+								...offBranch.map((record) => ({ record, onBranch: false })),
 							];
 						}
 
 						if (ordered.length === 0) {
-							return { content: [{ type: "text", text: "No anchors found." }], details: { anchors: 0 } };
+							return { content: [{ type: "text", text: "No records found." }], details: { records: 0 } };
 						}
 
 						const shown = ordered.slice(offset, offset + limit);
 						return {
-							content: [{ type: "text", text: renderViewResults(shown, ordered.length, offset) }],
+							content: [{ type: "text", text: renderViewResults(shown, ordered.length, offset, sessionFile) }],
 							details: { total: ordered.length, shown: shown.length, offset, limit },
 						};
 					}
 
 					// cwd or all — scan session files
-					const allAnchors: AnchorRecord[] = [];
+					const allRecords: TapeRecord[] = [];
 					for (const item of listSessionFiles()) {
 						if (signal?.aborted) break;
-						const parsed = parseSessionFile(item.file);
+						const parsed = sessionEntriesForScan(item, sessionFile, sessionEntries, ctx.cwd);
 						if (!parsed) continue;
 						if (scope === "cwd" && parsed.cwd !== ctx.cwd) continue;
-						allAnchors.push(...anchorsFromEntries(parsed.entries, item.file, parsed.cwd));
+						allRecords.push(...tapeRecordsFromEntries(parsed.entries, parsed.file, parsed.cwd));
 					}
 
-					allAnchors.sort((a, b) => (b.timestamp || "").localeCompare(a.timestamp || ""));
-					const total = allAnchors.length;
-					const page = allAnchors.slice(offset, offset + limit);
+					allRecords.sort((a, b) => (b.timestamp || "").localeCompare(a.timestamp || ""));
+					const total = allRecords.length;
+					const page = allRecords.slice(offset, offset + limit);
 
 					return {
 						content: [{ type: "text", text: renderCrossSessionView(page, total, offset, scope, sessionFile) }],
@@ -546,28 +741,37 @@ export default function (pi: ExtensionAPI) {
 
 				// ── search ──────────────────────────────────────
 				case "search": {
-					if (!params.query) {
-						return { content: [{ type: "text", text: "`query` is required for search." }], details: {} };
+					const query = params.query ?? "";
+					const start = parseFilterTimestamp(params.start, "start");
+					if (start.error) return { content: [{ type: "text", text: start.error }], details: {} };
+					const end = parseFilterTimestamp(params.end, "end");
+					if (end.error) return { content: [{ type: "text", text: end.error }], details: {} };
+					if (!query.trim() && start.value == null && end.value == null) {
+						return { content: [{ type: "text", text: "`query`, `start`, or `end` is required for search." }], details: {} };
 					}
+
 					const scope = params.scope ?? "session";
 					const kinds = normalizeSearchKinds(params.kinds);
+					const queryExpr = parseQuery(query);
+					const timeFilter = { start: start.value, end: end.value };
+					const timeFilterLabel = `${params.start ? ` start=${params.start}` : ""}${params.end ? ` end=${params.end}` : ""}`;
 					const limit = Math.max(0, Math.trunc(params.limit ?? 10));
 					const offset = Math.max(0, Math.trunc(params.offset ?? 0));
 
 					let allMatches: SearchResult[];
 
 					if (scope === "branch") {
-						allMatches = matchEntries(branchEntries, params.query, kinds);
+						allMatches = matchEntries(branchEntries, queryExpr, kinds, timeFilter, sessionFile, ctx.cwd);
 					} else if (scope === "session") {
-						allMatches = matchEntries(sessionEntries, params.query, kinds);
+						allMatches = matchEntries(sessionEntries, queryExpr, kinds, timeFilter, sessionFile, ctx.cwd);
 					} else {
 						allMatches = [];
 						for (const item of listSessionFiles()) {
 							if (signal?.aborted) break;
-							const parsed = parseSessionFile(item.file);
+							const parsed = sessionEntriesForScan(item, sessionFile, sessionEntries, ctx.cwd);
 							if (!parsed) continue;
 							if (scope === "cwd" && parsed.cwd !== ctx.cwd) continue;
-							allMatches.push(...matchEntries(parsed.entries, params.query, kinds));
+							allMatches.push(...matchEntries(parsed.entries, queryExpr, kinds, timeFilter, parsed.file, parsed.cwd));
 						}
 					}
 
@@ -577,8 +781,8 @@ export default function (pi: ExtensionAPI) {
 					const page = allMatches.slice(offset, offset + limit);
 
 					return {
-						content: [{ type: "text", text: renderSearchResults(page, total, offset, params.query, kinds) }],
-						details: { results: page, total, scope, kinds, offset, limit },
+						content: [{ type: "text", text: renderSearchResults(page, total, offset, query, kinds, timeFilterLabel) }],
+						details: { results: page, total, scope, kinds, query, start: params.start, end: params.end, offset, limit },
 					};
 				}
 
@@ -609,7 +813,9 @@ export default function (pi: ExtensionAPI) {
 		// This keeps the transcript valid by never starting from a toolResult.
 		const entries = entriesFromMessages(messages);
 		const cutPoint = findCutPoint(entries, 0, anchorStartIdx, keepTokens);
-		const keepFromIdx = cutPoint.firstKeptEntryIndex;
+		const keepFromIdx = cutPoint.isSplitTurn && cutPoint.turnStartIndex >= 0
+			? cutPoint.turnStartIndex
+			: cutPoint.firstKeptEntryIndex;
 
 		// If everything fits, no need to trim
 		if (keepFromIdx === 0) return;
