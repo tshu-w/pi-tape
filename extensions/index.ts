@@ -561,7 +561,25 @@ function makeSummaryMessage(anchor: TapeAnchorData): any {
 // ============================================================================
 
 function firstSummaryLine(summary: string): string {
-	return (summary.split("\n")[0] ?? "").slice(0, 100);
+	let section: string | undefined;
+	let fallback = "";
+	for (const rawLine of summary.split("\n")) {
+		const line = rawLine.trim();
+		if (!line) continue;
+		if (!fallback) fallback = line;
+		const heading = line.match(/^#{1,6}\s+(.+)$/);
+		if (heading) {
+			section = heading[1].replace(/[:：]\s*$/, "");
+			continue;
+		}
+		const text = line
+			.replace(/^[-*+]\s+\[[ x]\]\s+/i, "")
+			.replace(/^[-*+]\s+/, "")
+			.replace(/^\d+\.\s+/, "")
+			.trim();
+		return `${section ? `${section}: ` : ""}${text}`.slice(0, 100);
+	}
+	return fallback.slice(0, 100);
 }
 
 function sessionLabel(record: TapeRecord | SearchResult, currentSessionFile?: string): string {
