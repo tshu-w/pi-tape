@@ -14,6 +14,7 @@ const DEFAULT_SEARCH_KINDS = ["message", "tool_result"] as const;
 const SEARCH_KINDS = ["message", "tool_result", "tool_call", "anchor", "compact", "summary", "custom"] as const;
 const SEARCH_KINDS_SET = new Set<string>(SEARCH_KINDS);
 const DEFAULT_SEARCH_KINDS_SET = new Set<string>(DEFAULT_SEARCH_KINDS);
+const SEARCH_INTERNAL_TOOL_NAMES = new Set(["tape"]);
 
 // ============================================================================
 // Types
@@ -350,6 +351,7 @@ function extractSearchItems(entry: any, sessionFile?: string, sessionCwd?: strin
 		if (!msg) return [];
 
 		if (msg.role === "toolResult") {
+			if (SEARCH_INTERNAL_TOOL_NAMES.has(msg.toolName)) return [];
 			let content = "";
 			if (typeof msg.content === "string") {
 				content = msg.content;
@@ -369,7 +371,7 @@ function extractSearchItems(entry: any, sessionFile?: string, sessionCwd?: strin
 				if (textContent) items.push({ kind: "message", role: "assistant", searchableText: textContent, payload: contentPayload(textContent), timestamp, sessionFile, sessionCwd });
 
 				const toolCalls = msg.content
-					.filter((block: any) => block?.type === "toolCall")
+					.filter((block: any) => block?.type === "toolCall" && !SEARCH_INTERNAL_TOOL_NAMES.has(block.name))
 					.map((block: any) => `${block.name}(${JSON.stringify(block.arguments)})`)
 					.join(" ");
 				if (toolCalls) items.push({ kind: "tool_call", role: "assistant", searchableText: toolCalls, payload: contentPayload(toolCalls), timestamp, sessionFile, sessionCwd });
@@ -630,16 +632,38 @@ function renderCrossSessionView(records: TapeRecord[], total: number, offset: nu
 	return `records (${records.length}/${total}, offset ${offset}, scope ${scope})\n${lines.join("\n")}`;
 }
 
-function renderSearchResults(results: SearchResult[], total: number, offset: number, query: string, kinds: SearchKind[], timeFilterLabel: string): string {
+function renderSearchResults(results: SearchResult[], total: number, offset: number, query: string, kinds: SearchKind[], timeFilterLabel: string, currentSessionFile?: string, showSessionLabel = false): string {
 	const isDefaultKinds = kinds.length === DEFAULT_SEARCH_KINDS_SET.size && kinds.every((k) => DEFAULT_SEARCH_KINDS_SET.has(k));
 	const kindSuffix = isDefaultKinds ? "" : ` kinds=${kinds.join(",")}`;
 	const queryLabel = query ? `"${query}"` : "<all>";
 	const suffix = `${kindSuffix}${timeFilterLabel}`;
 	if (results.length === 0) return `No entries matching ${queryLabel}${suffix} (offset ${offset}).`;
 	const lines = results.map((r) => {
-		return `- [${r.entryId.slice(0, 8)}] ${r.kind}/${r.role} (${formatTimestampSecond(r.timestamp)})\n  ${r.preview}`;
+		const metadata = [
+			...(showSessionLabel ? [`session=${sessionLabel(r, currentSessionFile)}`] : []),
+			`time=${formatTimestampSecond(r.timestamp)}`,
+		].join(" ");
+		return `- [${r.entryId.slice(0, 8)}] ${r.kind}/${r.role} ${metadata}\n  ${r.preview}`;
 	});
 	return `search ${queryLabel}${suffix} (${results.length}/${total}, offset ${offset})\n${lines.join("\n\n")}`;
+}
+
+function entryViewText(entry: any, sessionFile?: string, sessionCwd?: string): string {
+	const items = extractSearchItems(entry, sessionFile, sessionCwd);
+	if (items.length > 0) {
+		return items.map((item) => `## ${item.kind}/${item.role}\n${item.searchableText}`).join("\n\n");
+	}
+	return JSON.stringify(entry, null, 2);
+}
+
+function renderEntryView(entry: any, sessionFile: string | undefined, sessionCwd: string | undefined, offset: number, limit: number): string {
+	const text = entryViewText(entry, sessionFile, sessionCwd);
+	const lines = text.split("\n");
+	const start = Math.min(offset, lines.length);
+	const end = Math.min(lines.length, start + limit);
+	const body = lines.slice(start, end).join("\n");
+	const suffix = end < lines.length ? `\n\n[Showing lines ${start + 1}-${end} of ${lines.length}. Use offset=${end} to continue.]` : "";
+	return `entry [${String(entry.id ?? "").slice(0, 8)}] ${formatTimestampSecond(normalizeTimestamp(entry.timestamp))}\n${body}${suffix}`;
 }
 
 // ============================================================================
@@ -655,13 +679,13 @@ export default function (pi: ExtensionAPI) {
 			"anchor: create a semantic boundary with summary.",
 			"search: find old entries by keyword with optional kind and time filters.",
 			"info: show current tape boundary and context usage.",
-			"view: list anchors and compact records (default: same cwd across sessions).",
+			"view: list anchors and compact records, or display an entry by entryId.",
 		].join(" "),
 		promptSnippet: "Manage semantic context with anchors and searchable history",
 		promptGuidelines: [
 			"Use tape(action='anchor', name=..., summary=...) when switching topics or after a major task completes.",
 			"When context usage is high, use tape(action='anchor') to checkpoint before continuing.",
-			"Use tape(action='view') to discover anchors and compact records from this or previous sessions.",
+			"Use tape(action='view') to discover anchors and compact records, or tape(action='view', entryId=...) to inspect a search result.",
 			"Use tape(action='search', query=...) to recover old messages, tool results, or prior context when returning to an older topic.",
 			"Use tape(action='info') to check anchor count and context usage.",
 			"Prefer pi-style structured summaries: Goal, Constraints & Preferences, Progress, Key Decisions, Next Steps, Critical Context.",
@@ -672,6 +696,8 @@ export default function (pi: ExtensionAPI) {
 			}),
 			name: Type.Optional(Type.String({ description: "Anchor name (must be unique). Required for anchor." })),
 			summary: Type.Optional(Type.String({ description: "Retrospective state summary. Required for anchor." })),
+			entryId: Type.Optional(Type.String({ description: "Entry ID/prefix to display with action='view'." })),
+			sessionFile: Type.Optional(Type.String({ description: "Session file path for entry lookup, usually from search results." })),
 			query: Type.Optional(Type.String({ description: "Search query. Space means AND; | means OR. Optional when start/end is set." })),
 			start: Type.Optional(Type.String({ description: "Inclusive timestamp lower bound for search." })),
 			end: Type.Optional(Type.String({ description: "Inclusive timestamp upper bound for search." })),
@@ -681,8 +707,8 @@ export default function (pi: ExtensionAPI) {
 			scope: Type.Optional(StringEnum(["branch", "session", "cwd", "all"] as const, {
 				description: "Scope. Default: session for search, cwd for view.",
 			})),
-			limit: Type.Optional(Type.Number({ description: "Max results. Default: 20 for view, 10 for search." })),
-			offset: Type.Optional(Type.Number({ description: "Skip N results. Default: 0." })),
+			limit: Type.Optional(Type.Number({ description: "Max results/lines. Default: 20 for view records, 200 for entry view, 10 for search." })),
+			offset: Type.Optional(Type.Number({ description: "Skip N records/lines. Default: 0." })),
 		}),
 		async execute(_id, params, signal, _onUpdate, ctx) {
 			const branchEntries = ctx.sessionManager.getBranch() as any[];
@@ -755,8 +781,49 @@ export default function (pi: ExtensionAPI) {
 				// ── view ────────────────────────────────────────
 				case "view": {
 					const scope = params.scope ?? "cwd";
-					const limit = Math.max(0, Math.trunc(params.limit ?? 20));
+					const limit = Math.max(0, Math.trunc(params.limit ?? (params.entryId ? 200 : 20)));
 					const offset = Math.max(0, Math.trunc(params.offset ?? 0));
+
+					if (params.entryId) {
+						const entryId = params.entryId;
+						const candidates: Array<{ entry: any; file?: string; cwd?: string }> = [];
+						const addMatches = (entries: any[], file?: string, cwd?: string) => {
+							for (const entry of entries) {
+								if (typeof entry?.id === "string" && entry.id.startsWith(entryId)) candidates.push({ entry, file, cwd });
+							}
+						};
+
+						if (params.sessionFile) {
+							const parsed = sessionEntriesForScan({ file: params.sessionFile }, sessionFile, sessionEntries, ctx.cwd);
+							if (parsed) addMatches(parsed.entries, parsed.file, parsed.cwd);
+						} else if (scope === "branch") {
+							addMatches(branchEntries, sessionFile, ctx.cwd);
+						} else if (scope === "session") {
+							addMatches(sessionEntries, sessionFile, ctx.cwd);
+						} else {
+							for (const item of listSessionFiles()) {
+								if (signal?.aborted) break;
+								const parsed = sessionEntriesForScan(item, sessionFile, sessionEntries, ctx.cwd);
+								if (!parsed) continue;
+								if (scope === "cwd" && parsed.cwd !== ctx.cwd) continue;
+								addMatches(parsed.entries, parsed.file, parsed.cwd);
+							}
+						}
+
+						if (candidates.length === 0) {
+							return { content: [{ type: "text", text: `No entry matching ${entryId}.` }], details: { entryId } };
+						}
+						if (candidates.length > 1) {
+							const lines = candidates.slice(0, 10).map((c) => `- [${c.entry.id.slice(0, 8)}] session=${sessionLabel({ sessionFile: c.file } as SearchResult, sessionFile)} time=${formatTimestampSecond(normalizeTimestamp(c.entry.timestamp))}`);
+							return { content: [{ type: "text", text: `Entry prefix ${entryId} is ambiguous (${candidates.length} matches):\n${lines.join("\n")}` }], details: { entryId, matches: candidates.length } };
+						}
+
+						const found = candidates[0];
+						return {
+							content: [{ type: "text", text: renderEntryView(found.entry, found.file, found.cwd, offset, Math.max(1, limit)) }],
+							details: { entryId: found.entry.id, sessionFile: found.file, sessionCwd: found.cwd, offset, limit },
+						};
+					}
 
 					if (scope === "branch" || scope === "session") {
 						const sessionRecords = tapeRecordsFromEntries(sessionEntries, sessionFile, ctx.cwd);
@@ -848,7 +915,7 @@ export default function (pi: ExtensionAPI) {
 					const page = dedupedMatches.slice(offset, offset + limit);
 
 					return {
-						content: [{ type: "text", text: renderSearchResults(page, total, offset, query, kinds, timeFilterLabel) }],
+						content: [{ type: "text", text: renderSearchResults(page, total, offset, query, kinds, timeFilterLabel, sessionFile, scope === "cwd" || scope === "all") }],
 						details: { results: page, total, scope, kinds, query, start: params.start, end: params.end, offset, limit },
 					};
 				}
