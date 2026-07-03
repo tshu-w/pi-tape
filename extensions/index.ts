@@ -1,3 +1,22 @@
+/**
+ * pi-tape — Tape-style context management for pi.
+ *
+ * Anchors are stored as tool results with `details.tapeAnchor`, so they
+ * persist in the session file without separate storage. A context hook
+ * rebuilds the model context from the latest anchor: its summary is
+ * injected as history, followed by a recent-message window cut at
+ * compact-compatible points (never starting from a toolResult).
+ *
+ * Native compaction coexists with anchors — whichever boundary is later
+ * effectively wins. An anchor newer than the last compaction rebuilds
+ * context from itself; if compaction consumed the anchor message, the
+ * compaction summary governs until the next anchor.
+ *
+ * Recall follows grep -> read: search returns bounded previews; full
+ * content is read via view(entryId) with line pagination. Tape's own
+ * tool calls/results are excluded from search indexing to avoid echoes.
+ */
+
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { StringEnum } from "@earendil-works/pi-ai";
@@ -424,7 +443,7 @@ function matchingQueryTerm(content: string, query: QueryExpr): string | undefine
 	const lower = content.toLowerCase();
 	for (const andTerms of query) {
 		if (!andTerms.every((term) => lower.includes(term))) continue;
-		return andTerms.find((term) => lower.includes(term));
+		return andTerms[0];
 	}
 	return undefined;
 }
@@ -479,15 +498,14 @@ function recordDedupeKey(record: TapeRecord): string {
 	if (record.kind === "anchor") {
 		return `${record.kind}:${record.sourceSessionFile ?? record.sessionFile ?? ""}:${record.entryId}`;
 	}
-	return `${record.kind}:${record.entryId}:${record.timestamp}:${record.summary}`;
+	return `${record.kind}:${record.entryId}:${record.timestamp}`;
 }
 
 function searchResultDedupeKey(result: SearchResult): string {
 	if (result.kind === "anchor") {
 		return `${result.kind}:${result.sourceSessionFile ?? result.sessionFile ?? ""}:${result.entryId}`;
 	}
-	const summary = typeof result.payload.summary === "string" ? result.payload.summary : result.preview;
-	return `${result.kind}:${result.entryId}:${result.timestamp}:${summary}`;
+	return `${result.kind}:${result.entryId}:${result.timestamp}`;
 }
 
 function dedupeTapeRecords(records: TapeRecord[]): TapeRecord[] {
@@ -584,7 +602,7 @@ function firstSummaryLine(summary: string): string {
 	return fallback.slice(0, 100);
 }
 
-function sessionLabel(record: TapeRecord | SearchResult, currentSessionFile?: string): string {
+function sessionLabel(record: { sessionFile?: string }, currentSessionFile?: string): string {
 	if (currentSessionFile && record.sessionFile === currentSessionFile) return "(current)";
 	return path.basename(record.sessionFile ?? "unknown").replace(".jsonl", "");
 }
@@ -694,7 +712,7 @@ export default function (pi: ExtensionAPI) {
 			action: StringEnum(["info", "anchor", "view", "search"] as const, {
 				description: "Action to perform",
 			}),
-			name: Type.Optional(Type.String({ description: "Anchor name (must be unique). Required for anchor." })),
+			name: Type.Optional(Type.String({ description: "Anchor name (unique per branch). Required for anchor." })),
 			summary: Type.Optional(Type.String({ description: "Retrospective state summary. Required for anchor." })),
 			entryId: Type.Optional(Type.String({ description: "Entry ID/prefix to display with action='view'." })),
 			sessionFile: Type.Optional(Type.String({ description: "Session file path for entry lookup, usually from search results." })),
@@ -714,11 +732,11 @@ export default function (pi: ExtensionAPI) {
 			const branchEntries = ctx.sessionManager.getBranch() as any[];
 			const sessionEntries = ctx.sessionManager.getEntries() as any[];
 			const sessionFile = ctx.sessionManager.getSessionFile();
-			const currentBranchAnchors = anchorRecordsFromEntries(branchEntries, sessionFile, ctx.cwd);
 
 			switch (params.action) {
 				// ── info ─────────────────────────────────────────
 				case "info": {
+					const currentBranchAnchors = anchorRecordsFromEntries(branchEntries, sessionFile, ctx.cwd);
 					const sessionAnchors = anchorRecordsFromEntries(sessionEntries, sessionFile, ctx.cwd);
 					const latest = currentBranchAnchors.at(-1);
 					const usage = ctx.getContextUsage?.();
@@ -750,6 +768,7 @@ export default function (pi: ExtensionAPI) {
 					if (params.name.startsWith("compact/")) {
 						return { content: [{ type: "text", text: "Anchor names starting with `compact/` are reserved for compact records." }], details: {} };
 					}
+					const currentBranchAnchors = anchorRecordsFromEntries(branchEntries, sessionFile, ctx.cwd);
 					const existing = currentBranchAnchors.find((a) => a.name === params.name);
 					if (existing) {
 						return { content: [{ type: "text", text: `Anchor "${params.name}" already exists on this branch at [${existing.entryId.slice(0, 8)}]. Choose a new name.` }], details: {} };
@@ -814,7 +833,7 @@ export default function (pi: ExtensionAPI) {
 							return { content: [{ type: "text", text: `No entry matching ${entryId}.` }], details: { entryId } };
 						}
 						if (candidates.length > 1) {
-							const lines = candidates.slice(0, 10).map((c) => `- [${c.entry.id.slice(0, 8)}] session=${sessionLabel({ sessionFile: c.file } as SearchResult, sessionFile)} time=${formatTimestampSecond(normalizeTimestamp(c.entry.timestamp))}`);
+							const lines = candidates.slice(0, 10).map((c) => `- [${c.entry.id.slice(0, 8)}] session=${sessionLabel({ sessionFile: c.file }, sessionFile)} time=${formatTimestampSecond(normalizeTimestamp(c.entry.timestamp))}`);
 							return { content: [{ type: "text", text: `Entry prefix ${entryId} is ambiguous (${candidates.length} matches):\n${lines.join("\n")}` }], details: { entryId, matches: candidates.length } };
 						}
 
