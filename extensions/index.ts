@@ -380,25 +380,74 @@ function tapeRecordsFromEntries(entries: any[], sessionFile?: string, sessionCwd
 }
 
 // ============================================================================
-// Token estimation
+// Record index (mtime-keyed cache for cross-session record scans)
 // ============================================================================
 
-function estimateMessageTokens(msg: any): number {
-	let chars = 0;
-	if (typeof msg.content === "string") {
-		chars = msg.content.length;
-	} else if (Array.isArray(msg.content)) {
-		for (const block of msg.content) {
-			if (typeof block === "string") chars += block.length;
-			else if (block?.text) chars += block.text.length;
-			else if (block?.thinking) chars += block.thinking.length;
-			else if (block?.type === "toolCall") {
-				chars += (block.name?.length ?? 0) + JSON.stringify(block.arguments ?? {}).length;
-			}
+interface RecordIndexEntry {
+	mtime: number;
+	cwd?: string;
+	records: TapeRecord[];
+}
+
+function recordIndexPath(): string {
+	return path.join(getAgentDir(), "tape", "index.json");
+}
+
+function loadRecordIndex(): Record<string, RecordIndexEntry> {
+	try {
+		const parsed = JSON.parse(fs.readFileSync(recordIndexPath(), "utf-8"));
+		if (parsed?.version === 1 && parsed.files && typeof parsed.files === "object") return parsed.files;
+	} catch { /* missing or corrupt — rebuild lazily */ }
+	return {};
+}
+
+function saveRecordIndex(files: Record<string, RecordIndexEntry>): void {
+	const target = recordIndexPath();
+	const tmp = `${target}.tmp`;
+	try {
+		fs.mkdirSync(path.dirname(target), { recursive: true });
+		fs.writeFileSync(tmp, JSON.stringify({ version: 1, files }));
+		fs.renameSync(tmp, target);
+	} catch { /* cache only — losing it just means re-parsing */ }
+}
+
+/**
+ * Collect anchor/compact records across session files. Closed session files
+ * never change, so parsed records are cached in an index keyed by mtime and
+ * only new or modified files are re-parsed. The current session is always
+ * read live from memory. Full-text search is unaffected (it needs entries).
+ */
+function scanTapeRecords(scope: "cwd" | "all", cwd: string, sessionFile: string | undefined, sessionEntries: any[], signal?: AbortSignal): TapeRecord[] {
+	const index = loadRecordIndex();
+	const next: Record<string, RecordIndexEntry> = {};
+	let dirty = false;
+	const records: TapeRecord[] = [];
+
+	for (const item of listSessionFiles()) {
+		if (signal?.aborted) break;
+
+		if (isCurrentSessionFile(item.file, sessionFile)) {
+			records.push(...tapeRecordsFromEntries(sessionEntries, sessionFile, cwd));
+			continue;
 		}
+
+		let cached = index[item.file];
+		if (!cached || cached.mtime !== item.mtime) {
+			const parsed = parseSessionFile(item.file);
+			if (!parsed) continue;
+			cached = { mtime: item.mtime, cwd: parsed.cwd, records: tapeRecordsFromEntries(parsed.entries, item.file, parsed.cwd) };
+			dirty = true;
+		}
+		next[item.file] = cached;
+
+		if (scope === "cwd" && cached.cwd !== cwd) continue;
+		records.push(...cached.records);
 	}
-	if (msg.summary) chars += msg.summary.length;
-	return Math.ceil(chars / 4);
+
+	if (!signal?.aborted && (dirty || Object.keys(next).length !== Object.keys(index).length)) {
+		saveRecordIndex(next);
+	}
+	return records;
 }
 
 // ============================================================================
@@ -973,15 +1022,8 @@ export default function (pi: ExtensionAPI) {
 						};
 					}
 
-					// cwd or all — scan session files
-					const allRecords: TapeRecord[] = [];
-					for (const item of listSessionFiles()) {
-						if (signal?.aborted) break;
-						const parsed = sessionEntriesForScan(item, sessionFile, sessionEntries, ctx.cwd);
-						if (!parsed) continue;
-						if (scope === "cwd" && parsed.cwd !== ctx.cwd) continue;
-						allRecords.push(...tapeRecordsFromEntries(parsed.entries, parsed.file, parsed.cwd));
-					}
+					// cwd or all — scan session files (index-cached)
+					const allRecords = scanTapeRecords(scope, ctx.cwd, sessionFile, sessionEntries, signal);
 
 					allRecords.sort((a, b) => (b.timestamp || "").localeCompare(a.timestamp || ""));
 					const dedupedRecords = dedupeTapeRecords(allRecords);
@@ -1049,7 +1091,8 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	// ── Notes + recent anchors: system prompt injection ──────────────
-	// Cross-session anchors are scanned once per session (file IO); branch
+	// Cross-session anchors are scanned once per session, backed by the
+	// mtime-keyed record index so unchanged files are not re-parsed; branch
 	// anchors are read live so anchors created this session appear
 	// immediately. Notes files are re-read each turn — unchanged content
 	// yields an identical prompt, so prompt caching is unaffected.
@@ -1059,13 +1102,8 @@ export default function (pi: ExtensionAPI) {
 		const sessionFile = ctx.sessionManager.getSessionFile();
 
 		if (crossSessionAnchors === null) {
-			crossSessionAnchors = [];
-			for (const item of listSessionFiles()) {
-				if (isCurrentSessionFile(item.file, sessionFile)) continue;
-				const parsed = parseSessionFile(item.file);
-				if (!parsed || parsed.cwd !== ctx.cwd) continue;
-				crossSessionAnchors.push(...anchorRecordsFromEntries(parsed.entries, item.file, parsed.cwd));
-			}
+			crossSessionAnchors = scanTapeRecords("cwd", ctx.cwd, sessionFile, [], undefined)
+				.filter((record) => record.kind === "anchor");
 		}
 
 		const branchAnchors = anchorRecordsFromEntries(ctx.sessionManager.getBranch() as any[], sessionFile, ctx.cwd);

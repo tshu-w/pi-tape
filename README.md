@@ -62,5 +62,19 @@ Default search kinds are `message` + `tool_result`; anchors are searchable with 
 - Native compaction and anchors coexist — whichever boundary is later effectively wins. An anchor newer than the last compaction rebuilds context from itself; if compaction consumed the anchor message, the compaction summary governs until the next anchor.
 - Anchor names are unique per branch; names starting with `compact/` are reserved for compact records.
 - `view` defaults to `scope='cwd'`, listing anchors and compact records across all sessions in the same working directory for cross-session discovery. `search` defaults to `scope='session'`.
+- Cross-session record listings (`view` and the injected recent-anchors list) are cached in `<agent-dir>/tape/index.json`, keyed by session-file mtime — closed session files are parsed once. Full-text `search` still scans files. The index is a disposable cache: corrupt or missing, it is rebuilt lazily.
 - Compact summaries appear in `view` and `search` as `compact/YYYYMMDD-HHMMSS` records, but they do not become tape boundaries.
 - Date-only search filters cover whole local days: `start=YYYY-MM-DD` begins at 00:00:00 and `end=YYYY-MM-DD` ends at 23:59:59.999.
+
+## Testing
+
+```bash
+npm install && npm test
+```
+
+Tests load the real extension (node strips types natively) against a mocked
+ExtensionAPI in an isolated agent dir. `tests/rebuild.test.mjs` pins the
+context-rebuild contract from the design header: summary-first rebuild,
+compact-compatible cuts (never starting from a toolResult), and
+latest-anchor-wins. `tests/notes.test.mjs` covers notes injection, budgets,
+reminders, and the record index.

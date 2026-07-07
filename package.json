@@ -5,6 +5,10 @@
 	"keywords": ["pi-package", "pi-extension", "context", "tape", "anchor"],
 	"license": "MIT",
 	"repository": "github:tshu-w/pi-tape",
+	"type": "module",
+	"scripts": {
+		"test": "node --test tests/*.test.mjs"
+	},
 	"pi": {
 		"extensions": ["./extensions"]
 	},
