@@ -15,9 +15,16 @@
  * Recall follows grep -> read: search returns bounded previews; full
  * content is read via view(entryId) with line pagination. Tape's own
  * tool calls/results are excluded from search indexing to avoid echoes.
+ *
+ * Notes are the mutable half of the memory model: the tape is an
+ * append-only log of what happened, notes files hold durable
+ * cross-session facts the model maintains with standard file tools.
+ * Notes (global + per-project) and recent anchor names are appended to
+ * the system prompt each turn via before_agent_start.
  */
 
 import * as fs from "node:fs";
+import * as os from "node:os";
 import * as path from "node:path";
 import { StringEnum } from "@earendil-works/pi-ai";
 import { DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, findCutPoint, getAgentDir, truncateHead, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
@@ -28,6 +35,10 @@ import { Type } from "typebox";
 // ============================================================================
 
 const DEFAULT_KEEP_RECENT_TOKENS = 20000;
+const NOTES_BUDGET_LINES = 150;
+const NOTES_MAX_LINES = 400;
+const NOTES_MAX_BYTES = 16 * 1024;
+const RECENT_ANCHORS_LIMIT = 10;
 const SEARCH_PREVIEW_LENGTH = 200;
 const DEFAULT_SEARCH_KINDS = ["message", "tool_result"] as const;
 const SEARCH_KINDS = ["message", "tool_result", "tool_call", "anchor", "compact", "summary", "custom"] as const;
@@ -158,6 +169,92 @@ function sessionEntriesForScan(item: { file: string }, sessionFile: string | und
 	if (isCurrentSessionFile(item.file, sessionFile)) return { file: sessionFile!, cwd, entries: sessionEntries };
 	const parsed = parseSessionFile(item.file);
 	return parsed ? { file: item.file, ...parsed } : null;
+}
+
+// ============================================================================
+// Notes files (durable cross-session state)
+// ============================================================================
+
+interface NotesFile {
+	path: string;
+	exists: boolean;
+	content: string;
+	lines: number;
+	truncated: boolean;
+}
+
+function cwdSlug(cwd: string): string {
+	return `--${cwd.replace(/^[/\\]/, "").replace(/[/\\:]/g, "-")}--`;
+}
+
+function globalNotesPath(): string {
+	return path.join(getAgentDir(), "tape", "notes.md");
+}
+
+function projectNotesPath(cwd: string): string {
+	return path.join(getAgentDir(), "tape", cwdSlug(cwd), "notes.md");
+}
+
+function displayPath(file: string): string {
+	const home = os.homedir();
+	return file.startsWith(home) ? `~${file.slice(home.length)}` : file;
+}
+
+function readNotesFile(file: string): NotesFile {
+	let raw: string;
+	try {
+		raw = fs.readFileSync(file, "utf-8");
+	} catch {
+		return { path: file, exists: false, content: "", lines: 0, truncated: false };
+	}
+	const trimmed = raw.trimEnd();
+	const lines = trimmed ? trimmed.split("\n").length : 0;
+	const truncation = truncateHead(trimmed, { maxLines: NOTES_MAX_LINES, maxBytes: NOTES_MAX_BYTES });
+	return { path: file, exists: true, content: truncation.content, lines, truncated: truncation.truncated };
+}
+
+function notesStatusLabel(notes: NotesFile): string {
+	const over = notes.lines > NOTES_BUDGET_LINES ? ", over budget" : "";
+	return `${displayPath(notes.path)}, ${notes.lines}/${NOTES_BUDGET_LINES} lines${over}`;
+}
+
+const NOTES_USAGE = [
+	"Agent-maintained cross-session notes. One fact per line; edit the files directly.",
+	'When the user states a durable preference or correction, write it immediately with a "(user)" prefix; delete disproven entries.',
+	"Default to the global file; create the project file only for repo-specific facts.",
+	"Defer to AGENTS.md on conflict. Do not record task state, repo-derivable facts, or anything already covered by AGENTS.md.",
+].join("\n");
+
+function renderNotesBlock(cwd: string, recentAnchors: TapeRecord[]): string {
+	const globalNotes = readNotesFile(globalNotesPath());
+	const projectNotes = readNotesFile(projectNotesPath(cwd));
+	const lines: string[] = ["<tape-notes>", NOTES_USAGE];
+
+	if (globalNotes.exists) {
+		lines.push(`global (${notesStatusLabel(globalNotes)}):`, globalNotes.content);
+	} else {
+		lines.push(`global notes: none yet — create ${displayPath(globalNotes.path)}`);
+	}
+	if (projectNotes.exists) {
+		lines.push(`project (${notesStatusLabel(projectNotes)}):`, projectNotes.content);
+	} else {
+		lines.push(`project notes: none yet — create ${displayPath(projectNotes.path)} for repo-specific facts`);
+	}
+	for (const notes of [globalNotes, projectNotes]) {
+		if (notes.exists && notes.lines > NOTES_BUDGET_LINES) {
+			lines.push(`note: ${displayPath(notes.path)} over budget (${notes.lines}/${NOTES_BUDGET_LINES} lines), consider distilling`);
+		}
+		if (notes.truncated) {
+			lines.push(`note: ${displayPath(notes.path)} truncated at ${NOTES_MAX_LINES} lines/${NOTES_MAX_BYTES} bytes — distill required`);
+		}
+	}
+	lines.push("</tape-notes>");
+
+	if (recentAnchors.length > 0) {
+		const items = recentAnchors.map((r) => `[${r.name}] ${formatTimestampSecond(r.timestamp).slice(0, 10)}`);
+		lines.push(`recent anchors (cwd): ${items.join(" · ")}`);
+	}
+	return lines.join("\n");
 }
 
 // ============================================================================
@@ -696,7 +793,7 @@ export default function (pi: ExtensionAPI) {
 			"Tape-style context management.",
 			"anchor: create a semantic boundary with summary.",
 			"search: find old entries by keyword with optional kind and time filters.",
-			"info: show current tape boundary and context usage.",
+			"info: show current tape boundary, notes status, and context usage.",
 			"view: list anchors and compact records, or display an entry by entryId.",
 		].join(" "),
 		promptSnippet: "Manage semantic context with anchors and searchable history",
@@ -707,6 +804,7 @@ export default function (pi: ExtensionAPI) {
 			"Use tape(action='search', query=...) to recover old messages, tool results, or prior context when returning to an older topic.",
 			"Use tape(action='info') to check anchor count and context usage.",
 			"Prefer pi-style structured summaries: Goal, Constraints & Preferences, Progress, Key Decisions, Next Steps, Critical Context.",
+			"Record durable lessons in notes before anchoring — details may fall out of the recent window after rebuild.",
 		],
 		parameters: Type.Object({
 			action: StringEnum(["info", "anchor", "view", "search"] as const, {
@@ -740,10 +838,14 @@ export default function (pi: ExtensionAPI) {
 					const sessionAnchors = anchorRecordsFromEntries(sessionEntries, sessionFile, ctx.cwd);
 					const latest = currentBranchAnchors.at(-1);
 					const usage = ctx.getContextUsage?.();
+					const globalNotes = readNotesFile(globalNotesPath());
+					const projectNotes = readNotesFile(projectNotesPath(ctx.cwd));
 					const lines = [
 						`branch anchors: ${currentBranchAnchors.length}`,
 						`session anchors: ${sessionAnchors.length}`,
 						`latest boundary: ${latest ? latest.name : "(none)"}`,
+						`notes (global): ${globalNotes.exists ? notesStatusLabel(globalNotes) : `none — ${displayPath(globalNotes.path)}`}`,
+						`notes (project): ${projectNotes.exists ? notesStatusLabel(projectNotes) : `none — ${displayPath(projectNotes.path)}`}`,
 					];
 					if (usage?.tokens != null) {
 						lines.push(`context: ${usage.tokens}/${usage.contextWindow}`);
@@ -791,8 +893,9 @@ export default function (pi: ExtensionAPI) {
 						},
 					};
 
+					const notesTarget = fs.existsSync(projectNotesPath(ctx.cwd)) ? projectNotesPath(ctx.cwd) : globalNotesPath();
 					return {
-						content: [{ type: "text", text: `[Anchor: ${params.name}]\n${params.summary}` }],
+						content: [{ type: "text", text: `[Anchor: ${params.name}]\n${params.summary}\n\nIf durable lessons from this segment are missing from notes, add them now (edit ${displayPath(notesTarget)}).` }],
 						details: { tapeAnchor },
 					};
 				}
@@ -943,6 +1046,34 @@ export default function (pi: ExtensionAPI) {
 					return { content: [{ type: "text", text: `Unknown action: ${params.action}` }], details: {} };
 			}
 		},
+	});
+
+	// ── Notes + recent anchors: system prompt injection ──────────────
+	// Cross-session anchors are scanned once per session (file IO); branch
+	// anchors are read live so anchors created this session appear
+	// immediately. Notes files are re-read each turn — unchanged content
+	// yields an identical prompt, so prompt caching is unaffected.
+	let crossSessionAnchors: TapeRecord[] | null = null;
+
+	pi.on("before_agent_start", async (event, ctx) => {
+		const sessionFile = ctx.sessionManager.getSessionFile();
+
+		if (crossSessionAnchors === null) {
+			crossSessionAnchors = [];
+			for (const item of listSessionFiles()) {
+				if (isCurrentSessionFile(item.file, sessionFile)) continue;
+				const parsed = parseSessionFile(item.file);
+				if (!parsed || parsed.cwd !== ctx.cwd) continue;
+				crossSessionAnchors.push(...anchorRecordsFromEntries(parsed.entries, item.file, parsed.cwd));
+			}
+		}
+
+		const branchAnchors = anchorRecordsFromEntries(ctx.sessionManager.getBranch() as any[], sessionFile, ctx.cwd);
+		const recent = dedupeTapeRecords(
+			[...branchAnchors, ...crossSessionAnchors].sort((a, b) => (b.timestamp || "").localeCompare(a.timestamp || "")),
+		).slice(0, RECENT_ANCHORS_LIMIT);
+
+		return { systemPrompt: `${event.systemPrompt}\n\n${renderNotesBlock(ctx.cwd, recent)}` };
 	});
 
 	// ── Context hook: rebuild context from latest anchor ─────────────
