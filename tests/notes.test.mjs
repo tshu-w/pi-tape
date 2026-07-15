@@ -62,11 +62,11 @@ test("info reports notes status", async () => {
 	assert.match(text, /notes \(project\): none — /);
 });
 
-test("anchor reminder targets global notes; live anchor joins the list", async () => {
+test("anchor result carries the summary; live anchor joins the list", async () => {
 	const result = await tools.tape.execute("t2", { action: "anchor", name: "new-topic", summary: "Testing." }, undefined, undefined, ctx);
 	const text = result.content[0].text;
-	assert.ok(text.includes("add them now (edit "));
-	assert.ok(text.includes("tape/notes.md"));
+	assert.ok(text.includes("[Anchor: new-topic]"));
+	assert.ok(text.includes("Testing."));
 
 	branch.push({ type: "message", id: "bbbb2222-0000", timestamp: new Date().toISOString(), message: { role: "toolResult", toolName: "tape", content: result.content, details: result.details } });
 	const sp = await inject();
@@ -79,11 +79,9 @@ test("over-budget warning", async () => {
 	assert.ok(sp.includes("over budget (160/150 lines), consider distilling"));
 });
 
-test("project notes switch the reminder target and get injected", async () => {
+test("project notes get injected", async () => {
 	fs.mkdirSync(path.dirname(projectNotes), { recursive: true });
 	fs.writeFileSync(projectNotes, "- repo tests need bun\n");
-	const result = await tools.tape.execute("t3", { action: "anchor", name: "another", summary: "x" }, undefined, undefined, ctx);
-	assert.ok(result.content[0].text.includes(`${projectSlug}/notes.md`));
 	const sp = await inject();
 	assert.ok(sp.includes("repo tests need bun"));
 });

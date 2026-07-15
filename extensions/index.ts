@@ -219,10 +219,11 @@ function notesStatusLabel(notes: NotesFile): string {
 }
 
 const NOTES_USAGE = [
-	"Agent-maintained cross-session notes. One fact per line; edit the files directly.",
-	'When the user states a durable preference or correction, write it immediately with a "(user)" prefix; delete disproven entries.',
-	"Default to the global file; create the project file only for repo-specific facts.",
-	"Defer to AGENTS.md on conflict. Do not record task state, repo-derivable facts, or anything already covered by AGENTS.md.",
+	"Agent-maintained cross-session notes included in every system prompt. One fact per line; keep each line short; edit the files directly.",
+	'Record only: (a) user preferences and corrections — write immediately with a "(user)" prefix; (b) verified environment or external facts that would change future decisions or prevent repeated failure, and have no authoritative home elsewhere.',
+	"Never record task state — it belongs in anchors. Project results and findings belong in project docs.",
+	"Durable lessons about behavior or procedure belong in the narrowest authoritative source (AGENTS.md, a skill, or a script), not here; keep one source per rule.",
+	"Default to the global file; project file only for repo-specific facts. Defer to AGENTS.md on conflict; delete disproven or promoted entries.",
 ].join("\n");
 
 function renderNotesBlock(cwd: string, recentAnchors: TapeRecord[]): string {
@@ -853,7 +854,6 @@ export default function (pi: ExtensionAPI) {
 			"Use tape(action='search', query=...) to recover old messages, tool results, or prior context when returning to an older topic.",
 			"Use tape(action='info') to check anchor count and context usage.",
 			"Prefer pi-style structured summaries: Goal, Constraints & Preferences, Progress, Key Decisions, Next Steps, Critical Context.",
-			"Record durable lessons in notes before anchoring — details may fall out of the recent window after rebuild.",
 		],
 		parameters: Type.Object({
 			action: StringEnum(["info", "anchor", "view", "search"] as const, {
@@ -942,9 +942,8 @@ export default function (pi: ExtensionAPI) {
 						},
 					};
 
-					const notesTarget = fs.existsSync(projectNotesPath(ctx.cwd)) ? projectNotesPath(ctx.cwd) : globalNotesPath();
 					return {
-						content: [{ type: "text", text: `[Anchor: ${params.name}]\n${params.summary}\n\nIf durable lessons from this segment are missing from notes, add them now (edit ${displayPath(notesTarget)}).` }],
+						content: [{ type: "text", text: `[Anchor: ${params.name}]\n${params.summary}` }],
 						details: { tapeAnchor },
 					};
 				}

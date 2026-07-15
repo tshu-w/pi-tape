@@ -24,7 +24,7 @@ pi-tape manages two kinds of memory:
 - **tape** — the immutable history (append-only log). Recalled on demand via `search`/`view`.
 - **notes** — mutable durable facts the model maintains itself (state). Injected into the system prompt every turn, right after AGENTS.md.
 
-In [tape.systems](https://tape.systems/) terms, notes are a *memory view* over the tape, materialized as a file: every note originates from a fact on the tape (user feedback, a lesson from a work segment), and the model acts as an incremental reducer that folds new facts into the view at anchor time — assembly cost is paid at write time instead of read time. Each fold step is itself recorded on the tape as a normal edit, so the tape remains the source of truth and the derivative never replaces the original facts.
+In [tape.systems](https://tape.systems/) terms, notes are a *memory view* over the tape, materialized as a file: every note originates from a fact on the tape (user feedback, a lesson from a work segment), and the model acts as an incremental reducer that folds new facts into the view as they are confirmed — assembly cost is paid at write time instead of read time. Each fold step is itself recorded on the tape as a normal edit, so the tape remains the source of truth and the derivative never replaces the original facts.
 
 Notes live in plain markdown files that the model edits with standard file tools (no dedicated action):
 
@@ -36,10 +36,9 @@ Notes live in plain markdown files that the model edits with standard file tools
 Conventions (enforced by prompt, not code):
 
 - One fact per bullet line; delete entries that turn out to be wrong.
-- Explicit user preferences/corrections are written immediately with a `(user)` prefix, without waiting for an anchor.
-- Durable lessons are recorded in notes *before* anchoring — after the rebuild, details may already be out of the window.
+- Explicit user preferences/corrections are written immediately with a `(user)` prefix.
 - Notes are the model's empirical notebook; AGENTS.md remains the human-authored contract. On conflict, AGENTS.md wins. Promoting a note into AGENTS.md is a human action.
-- Scope: task state belongs to anchor summaries, repo-derivable facts to the repo, rules to AGENTS.md — none of them belong in notes.
+- Scope: task state belongs to anchor summaries, project results to project docs, repo-derivable facts to the repo, behavior rules and procedures to AGENTS.md/skills — none of them belong in notes.
 
 Budget: soft limit 150 lines per file (a warning is appended to the injected block); hard cap 400 lines / 16KB (content is truncated with an explicit marker — never silently).
 
@@ -77,4 +76,4 @@ ExtensionAPI in an isolated agent dir. `tests/rebuild.test.mjs` pins the
 context-rebuild contract from the design header: summary-first rebuild,
 compact-compatible cuts (never starting from a toolResult), and
 latest-anchor-wins. `tests/notes.test.mjs` covers notes injection, budgets,
-reminders, and the record index.
+anchor results, and the record index.
