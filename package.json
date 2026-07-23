@@ -18,5 +18,8 @@
 		"@earendil-works/pi-ai": "*",
 		"@earendil-works/pi-tui": "*",
 		"typebox": "*"
+	},
+	"devDependencies": {
+		"jiti": "^2.7.0"
 	}
 }
