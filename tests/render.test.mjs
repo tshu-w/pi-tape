@@ -17,7 +17,7 @@ test("tool call renders every argument in function-call form", () => {
 		"",
 	]);
 	assert.equal(styles[0][0], "toolTitle");
-	assert.equal(styles.filter(([color]) => color === "text").length, Object.keys(args).length);
-	assert.ok(styles.filter(([color]) => color === "muted").length > Object.keys(args).length);
+	assert.ok(styles.filter(([color]) => color === "text").length > Object.keys(args).length);
+	assert.equal(styles.some(([color]) => color === "muted"), false);
 	assert.equal(styles.some(([color]) => color === "accent"), false);
 });
