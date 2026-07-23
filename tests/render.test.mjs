@@ -14,6 +14,7 @@ test("tool call renders every argument in function-call form", () => {
 	const component = tools.tape.renderCall(args, theme, { expanded: false });
 	assert.deepEqual(component.render(1000).map((line) => line.trimEnd()), [
 		'<b>tape</b>(action="search", query="alpha beta", scope="cwd", limit=10)',
+		"",
 	]);
 	assert.equal(styles[0][0], "toolTitle");
 	assert.equal(styles.filter(([color]) => color === "text").length, Object.keys(args).length);
