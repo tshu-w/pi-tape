@@ -3,6 +3,9 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { createJiti } from "jiti";
+
+const jiti = createJiti(import.meta.url, { interopDefault: true });
 
 /** Create an isolated agent dir and point the extension at it. */
 export function makeAgentDir() {
@@ -13,7 +16,7 @@ export function makeAgentDir() {
 
 /** Load the extension with a mocked ExtensionAPI; returns registered surface. */
 export async function loadTape() {
-	const factory = (await import("../extensions/index.ts")).default;
+	const factory = (await jiti.import("../extensions/index.ts")).default;
 	const tools = {};
 	const handlers = {};
 	factory({

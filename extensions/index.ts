@@ -29,6 +29,7 @@ import * as path from "node:path";
 import { StringEnum } from "@earendil-works/pi-ai";
 import { DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, findCutPoint, getAgentDir, truncateHead, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
+import { renderToolCall } from "./render-call.js";
 
 // ============================================================================
 // Constants
@@ -875,6 +876,9 @@ export default function (pi: ExtensionAPI) {
 			limit: Type.Optional(Type.Number({ description: "Max results/lines. Default: 20 for view records, 200 for entry view, 10 for search." })),
 			offset: Type.Optional(Type.Number({ description: "Skip N records/lines. Default: 0." })),
 		}),
+		renderCall(args, theme) {
+			return renderToolCall("tape", args, theme);
+		},
 		async execute(_id, params, signal, _onUpdate, ctx) {
 			const branchEntries = ctx.sessionManager.getBranch() as any[];
 			const sessionEntries = ctx.sessionManager.getEntries() as any[];
