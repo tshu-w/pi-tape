@@ -28,7 +28,7 @@ test("injection: pointers when no notes exist, anchors from past sessions", asyn
 	assert.ok(sp.startsWith("SYS\n\n<tape-notes>"));
 	assert.match(sp, /global notes: none yet — create /);
 	assert.ok(sp.includes(`${projectSlug}/notes.md`));
-	assert.ok(sp.includes("recent anchors (cwd): [past-topic] 2026-07-01"));
+	assert.ok(sp.includes("recent anchors (cwd, session-start snapshot): [past-topic] 2026-07-01"));
 });
 
 test("record index is written and reused", async () => {
@@ -62,15 +62,35 @@ test("info reports notes status", async () => {
 	assert.match(text, /notes \(project\): none — /);
 });
 
-test("anchor result carries the summary; live anchor joins the list", async () => {
+test("anchor result carries the summary; system prompt snapshot stays frozen", async () => {
+	const before = await inject();
 	const result = await tools.tape.execute("t2", { action: "anchor", name: "new-topic", summary: "Testing." }, undefined, undefined, ctx);
 	const text = result.content[0].text;
 	assert.ok(text.includes("[Anchor: new-topic]"));
 	assert.ok(text.includes("Testing."));
+	assert.ok(!text.includes("recent anchors (this session)"), "first anchor has no prior-anchor list");
 
 	branch.push({ type: "message", id: "bbbb2222-0000", timestamp: new Date().toISOString(), message: { role: "toolResult", toolName: "tape", content: result.content, details: result.details } });
-	const sp = await inject();
-	assert.match(sp, /recent anchors \(cwd\): \[new-topic\] .* · \[past-topic\]/);
+	const after = await inject();
+	assert.equal(after, before, "system prompt must be byte-identical after anchoring");
+	assert.ok(!after.includes("new-topic"));
+
+	const second = await tools.tape.execute("t3", { action: "anchor", name: "second-topic", summary: "More." }, undefined, undefined, ctx);
+	assert.match(second.content[0].text, /recent anchors \(this session\): \[new-topic\] \d{4}-\d{2}-\d{2}/);
+	assert.ok(!second.content[0].text.includes("[second-topic]"), "current anchor is only in the title");
+});
+
+test("snapshot rescans when the session file changes", async () => {
+	writeSession(agentDir, "--fake--", "later.jsonl", cwd, [
+		anchorEntry({ id: "cccc3333-0000", name: "later-topic", summary: "Later work.", cwd, createdAt: "2026-07-20T10:00:00.000Z" }),
+	]);
+
+	const sameSession = await inject();
+	assert.ok(!sameSession.includes("later-topic"), "snapshot stays frozen within a session");
+
+	const otherCtx = makeCtx({ cwd, sessionFile: path.join(agentDir, "sessions", "--fake--", "next.jsonl") });
+	const next = (await handlers.before_agent_start({ type: "before_agent_start", prompt: "hi", systemPrompt: "SYS" }, otherCtx)).systemPrompt;
+	assert.match(next, /recent anchors \(cwd, session-start snapshot\): \[later-topic\] 2026-07-20 · \[past-topic\] 2026-07-01/);
 });
 
 test("over-budget warning", async () => {

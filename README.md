@@ -42,7 +42,7 @@ Conventions (enforced by prompt, not code):
 
 Budget: soft limit 150 lines per file (a warning is appended to the injected block); hard cap 400 lines / 16KB (content is truncated with an explicit marker — never silently).
 
-The injected block also lists recent anchor names for the current working directory (up to 10, live for the current session, scanned once for past sessions) as recall hooks into the tape.
+The injected block also lists recent anchor names for the current working directory (up to 10) as recall hooks into the tape. The list is a snapshot taken once per session: creating an anchor never changes the system prompt, so the prompt-cache prefix stays valid across turns. Anchors created during the session are listed in the anchor tool result instead, which survives the context rebuild.
 
 ## Recall workflow
 

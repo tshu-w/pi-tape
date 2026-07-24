@@ -18,8 +18,12 @@
  * Notes are the mutable half of the memory model: the tape is an
  * append-only log of what happened, notes files hold durable
  * cross-session facts the model maintains with standard file tools.
- * Notes (global + per-project) and recent anchor names are appended to
- * the system prompt each turn via before_agent_start.
+ * Notes (global + per-project) and a session-start snapshot of recent
+ * cwd anchors are appended to the system prompt via before_agent_start.
+ * The snapshot is frozen per session so creating an anchor never
+ * changes the system prompt (and never invalidates the prompt-cache
+ * prefix); anchors created this session are surfaced by the anchor
+ * tool result itself, which survives the context rebuild.
  */
 
 import * as fs from "node:fs";
@@ -262,10 +266,13 @@ function renderNotesBlock(cwd: string, recentAnchors: TapeRecord[]): string {
 	lines.push("</tape-notes>");
 
 	if (recentAnchors.length > 0) {
-		const items = recentAnchors.map((r) => `[${r.name}] ${formatTimestampSecond(r.timestamp).slice(0, 10)}`);
-		lines.push(`recent anchors (cwd): ${items.join(" · ")}`);
+		lines.push(`recent anchors (cwd, session-start snapshot): ${recentAnchors.map(anchorItemLabel).join(" · ")}`);
 	}
 	return lines.join("\n");
+}
+
+function anchorItemLabel(r: TapeRecord): string {
+	return `[${r.name}] ${formatTimestampSecond(r.timestamp).slice(0, 10)}`;
 }
 
 // ============================================================================
@@ -1036,8 +1043,13 @@ export default function (pi: ExtensionAPI) {
 						},
 					};
 
+					const priorAnchors = [...currentBranchAnchors].reverse().slice(0, RECENT_ANCHORS_LIMIT);
+					const priorLine = priorAnchors.length > 0
+						? `\n\nrecent anchors (this session): ${priorAnchors.map(anchorItemLabel).join(" · ")}`
+						: "";
+
 					return {
-						content: [{ type: "text", text: `[Anchor: ${params.name}]\n${params.summary}` }],
+						content: [{ type: "text", text: `[Anchor: ${params.name}]\n${params.summary}${priorLine}` }],
 						details: { tapeAnchor },
 					};
 				}
@@ -1184,27 +1196,27 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	// ── Notes + recent anchors: system prompt injection ──────────────
-	// Cross-session anchors are scanned once per session, backed by the
-	// mtime-keyed record index so unchanged files are not re-parsed; branch
-	// anchors are read live so anchors created this session appear
-	// immediately. Notes files are re-read each turn — unchanged content
-	// yields an identical prompt, so prompt caching is unaffected.
-	let crossSessionAnchors: TapeRecord[] | null = null;
+	// Cross-session anchors are scanned once per session (rescanned when the
+	// session file changes, e.g. /new or resume), backed by the mtime-keyed
+	// record index so unchanged files are not re-parsed. The snapshot is
+	// deliberately frozen: anchors created mid-session are shown by the
+	// anchor tool result instead, so the system prompt — the head of the
+	// prompt-cache prefix — stays byte-identical across turns. Notes files
+	// are re-read each turn — unchanged content yields an identical prompt,
+	// so prompt caching is unaffected.
+	let anchorSnapshot: { sessionFile: string | undefined; recent: TapeRecord[] } | null = null;
 
 	pi.on("before_agent_start", async (event, ctx) => {
 		const sessionFile = ctx.sessionManager.getSessionFile();
 
-		if (crossSessionAnchors === null) {
-			crossSessionAnchors = scanTapeRecords("cwd", ctx.cwd, sessionFile, [], undefined)
-				.filter((record) => record.kind === "anchor");
+		if (anchorSnapshot === null || anchorSnapshot.sessionFile !== sessionFile) {
+			const anchors = scanTapeRecords("cwd", ctx.cwd, sessionFile, [], undefined)
+				.filter((record) => record.kind === "anchor")
+				.sort((a, b) => (b.timestamp || "").localeCompare(a.timestamp || ""));
+			anchorSnapshot = { sessionFile, recent: dedupeTapeRecords(anchors).slice(0, RECENT_ANCHORS_LIMIT) };
 		}
 
-		const branchAnchors = anchorRecordsFromEntries(ctx.sessionManager.getBranch() as any[], sessionFile, ctx.cwd);
-		const recent = dedupeTapeRecords(
-			[...branchAnchors, ...crossSessionAnchors].sort((a, b) => (b.timestamp || "").localeCompare(a.timestamp || "")),
-		).slice(0, RECENT_ANCHORS_LIMIT);
-
-		return { systemPrompt: `${event.systemPrompt}\n\n${renderNotesBlock(ctx.cwd, recent)}` };
+		return { systemPrompt: `${event.systemPrompt}\n\n${renderNotesBlock(ctx.cwd, anchorSnapshot.recent)}` };
 	});
 
 	// ── Native compaction: summarize the projected anchor context ────
