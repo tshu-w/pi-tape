@@ -27,11 +27,13 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { StringEnum } from "@earendil-works/pi-ai";
 import {
+	buildContextEntries,
 	compact,
 	DEFAULT_MAX_BYTES,
 	DEFAULT_MAX_LINES,
 	findCutPoint,
 	getAgentDir,
+	sessionEntryToContextMessages,
 	truncateHead,
 	type ExtensionAPI,
 } from "@earendil-works/pi-coding-agent";
@@ -749,50 +751,10 @@ function findActiveAnchorBoundary(entries: any[]): ActiveAnchorBoundary | null {
 	return active;
 }
 
-function contextMessagesForEntry(entry: any): any[] {
-	if (entry?.type === "message") return [entry.message];
-	if (entry?.type === "custom_message") {
-		return [{
-			role: "custom",
-			customType: entry.customType,
-			content: entry.content,
-			display: entry.display,
-			details: entry.details,
-			timestamp: new Date(entry.timestamp).getTime(),
-		}];
-	}
-	if (entry?.type === "branch_summary") {
-		return [{ role: "branchSummary", summary: entry.summary, fromId: entry.fromId, timestamp: new Date(entry.timestamp).getTime() }];
-	}
-	if (entry?.type === "compaction") {
-		return [{ role: "compactionSummary", summary: entry.summary, tokensBefore: entry.tokensBefore, timestamp: new Date(entry.timestamp).getTime() }];
-	}
-	return [];
-}
-
-function compactAwareEntries(pathEntries: any[]): any[] {
-	let latestCompactionIndex = -1;
-	for (let i = pathEntries.length - 1; i >= 0; i--) {
-		if (pathEntries[i]?.type === "compaction") {
-			latestCompactionIndex = i;
-			break;
-		}
-	}
-	if (latestCompactionIndex < 0) return pathEntries;
-
-	const compaction = pathEntries[latestCompactionIndex];
-	const firstKeptIndex = pathEntries.findIndex((entry) => entry?.id === compaction.firstKeptEntryId);
-	return [
-		compaction,
-		...(firstKeptIndex >= 0 ? pathEntries.slice(firstKeptIndex, latestCompactionIndex) : []),
-		...pathEntries.slice(latestCompactionIndex + 1),
-	];
-}
-
 function messagesFromEntries(entries: any[], start: number, end: number): any[] {
 	const messages: any[] = [];
 	for (let i = start; i < end; i++) {
-		messages.push(...contextMessagesForEntry(entries[i]));
+		messages.push(...sessionEntryToContextMessages(entries[i]));
 	}
 	return messages;
 }
@@ -806,7 +768,7 @@ export function prepareProjectedAnchorCompaction(
 	const active = findActiveAnchorBoundary(branchEntries);
 	if (!active) return undefined;
 
-	const contextEntries = compactAwareEntries(branchEntries);
+	const contextEntries = buildContextEntries(branchEntries);
 	const anchorIndex = contextEntries.findIndex((entry: any) => entry?.id === active.entry.id);
 	if (anchorIndex < 0) return undefined;
 
@@ -822,13 +784,13 @@ export function prepareProjectedAnchorCompaction(
 
 	const postAnchorStart = anchorIndex + 1;
 	const hasPostAnchorCutPoint = contextEntries.slice(postAnchorStart).some((entry: any) =>
-		contextMessagesForEntry(entry).some((message: any) => message.role !== "toolResult"),
+		sessionEntryToContextMessages(entry).some((message: any) => message.role !== "toolResult"),
 	);
 	const recentCut = hasPostAnchorCutPoint
 		? findCutPoint(contextEntries, postAnchorStart, contextEntries.length, settings.keepRecentTokens)
 		: { firstKeptEntryIndex: anchorStartIndex, turnStartIndex: -1, isSplitTurn: false };
 	const firstKeptEntry = contextEntries[recentCut.firstKeptEntryIndex];
-	if (!firstKeptEntry?.id || contextMessagesForEntry(firstKeptEntry).every((message: any) => message.role === "toolResult")) return undefined;
+	if (!firstKeptEntry?.id || sessionEntryToContextMessages(firstKeptEntry).every((message: any) => message.role === "toolResult")) return undefined;
 
 	const historyEnd = recentCut.isSplitTurn ? recentCut.turnStartIndex : recentCut.firstKeptEntryIndex;
 	const messagesToSummarize = [
