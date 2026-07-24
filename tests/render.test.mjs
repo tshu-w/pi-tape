@@ -21,3 +21,18 @@ test("tool call renders every argument in function-call form", () => {
 	assert.equal(styles.some(([color]) => color === "muted"), false);
 	assert.equal(styles.some(([color]) => color === "accent"), false);
 });
+
+test("anchor summary is middle-truncated in the call line", () => {
+	const theme = { bold: (text) => text, fg: (_color, text) => text };
+	const summary = "H".repeat(150) + "T".repeat(150);
+	const component = tools.tape.renderCall({ action: "anchor", name: "n1", summary }, theme, { expanded: false });
+	const line = component.render(10000)[0];
+	assert.ok(line.includes('action="anchor"'));
+	assert.ok(line.includes("H".repeat(120) + "…" + "T".repeat(80)));
+	assert.equal(line.includes("H".repeat(121)), false);
+	assert.equal(line.includes("T".repeat(81)), false);
+	assert.ok(line.trimEnd().endsWith(')'));
+
+	const short = tools.tape.renderCall({ action: "anchor", summary: "brief" }, theme, { expanded: false });
+	assert.ok(short.render(10000)[0].includes('summary="brief"'));
+});
