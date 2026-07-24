@@ -14,9 +14,13 @@ export function makeAgentDir() {
 	return dir;
 }
 
+export async function loadTapeModule() {
+	return jiti.import("../extensions/index.ts");
+}
+
 /** Load the extension with a mocked ExtensionAPI; returns registered surface. */
 export async function loadTape() {
-	const factory = (await jiti.import("../extensions/index.ts")).default;
+	const factory = (await loadTapeModule()).default;
 	const tools = {};
 	const handlers = {};
 	factory({

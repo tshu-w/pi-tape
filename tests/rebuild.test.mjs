@@ -6,7 +6,17 @@ import { anchorMessage, loadTape, makeAgentDir, textMessage } from "./harness.mj
 
 const agentDir = makeAgentDir();
 const { handlers } = await loadTape();
-const rebuild = (messages) => handlers.context({ type: "context", messages });
+const entriesForMessages = (messages) => messages.map((message, index) => ({
+	type: "message",
+	id: `message-${index}`,
+	parentId: index > 0 ? `message-${index - 1}` : null,
+	timestamp: new Date(message.timestamp ?? Date.now()).toISOString(),
+	message,
+}));
+const rebuild = (messages, branch = entriesForMessages(messages)) => handlers.context(
+	{ type: "context", messages },
+	{ sessionManager: { getBranch: () => branch } },
+);
 
 const big = "x".repeat(8000); // ~2000 tokens by pi's estimate
 const anchor = (name, keepRecentTokens, createdAt = "2026-07-02T00:00:00.000Z") =>
@@ -69,6 +79,22 @@ test("latest anchor governs when several exist", async () => {
 	assert.ok(result);
 	assert.ok(result.messages[0].content.includes("new"));
 	assert.ok(!result.messages[0].content.includes("Summary of old."));
+});
+
+test("a newer native compaction disables a retained anchor marker", async () => {
+	const messages = [...longConversation(2), anchor("old", 2000), textMessage("user", "after")];
+	const branch = entriesForMessages(messages);
+	branch.push({
+		type: "compaction",
+		id: "native-compaction",
+		parentId: branch.at(-1).id,
+		timestamp: "2026-07-02T01:00:00.000Z",
+		summary: "New native summary.",
+		firstKeptEntryId: branch.at(-1).id,
+		tokensBefore: 10000,
+	});
+
+	assert.equal(await rebuild(messages, branch), undefined);
 });
 
 test.after(() => fs.rmSync(agentDir, { recursive: true, force: true }));

@@ -58,7 +58,7 @@ Default search kinds are `message` + `tool_result`; anchors are searchable with 
 ## Implementation notes
 
 - Context is rebuilt from the latest anchor: summary is injected as conversation history, followed by a window of messages kept via pi's compact cut points.
-- Native compaction and anchors coexist — whichever boundary is later effectively wins. An anchor newer than the last compaction rebuilds context from itself; if compaction consumed the anchor message, the compaction summary governs until the next anchor.
+- Native compaction and anchors coexist; the later boundary wins. Manual compaction summarizes the effective anchor-projected context, not the raw branch.
 - Anchor names are unique per branch; names starting with `compact/` are reserved for compact records.
 - `view` defaults to `scope='cwd'`, listing anchors and compact records across all sessions in the same working directory for cross-session discovery. `search` defaults to `scope='session'`.
 - Cross-session record listings (`view` and the injected recent-anchors list) are cached in `<agent-dir>/tape/index.json`, keyed by session-file mtime — closed session files are parsed once. Full-text `search` still scans files. The index is a disposable cache: corrupt or missing, it is rebuilt lazily.

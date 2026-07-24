@@ -8,9 +8,8 @@
  * compact-compatible points (never starting from a toolResult).
  *
  * Native compaction coexists with anchors — whichever boundary is later
- * effectively wins. An anchor newer than the last compaction rebuilds
- * context from itself; if compaction consumed the anchor message, the
- * compaction summary governs until the next anchor.
+ * effectively wins. An active anchor rebuilds model context; manual native
+ * compaction summarizes that projected context rather than the raw branch.
  *
  * Recall follows grep -> read: search returns bounded previews; full
  * content is read via view(entryId) with line pagination. Tape's own
@@ -27,7 +26,15 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { StringEnum } from "@earendil-works/pi-ai";
-import { DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, findCutPoint, getAgentDir, truncateHead, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import {
+	compact,
+	DEFAULT_MAX_BYTES,
+	DEFAULT_MAX_LINES,
+	findCutPoint,
+	getAgentDir,
+	truncateHead,
+	type ExtensionAPI,
+} from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { renderToolCall } from "./render-call.js";
 
@@ -724,6 +731,127 @@ function makeSummaryMessage(anchor: TapeAnchorData): any {
 	};
 }
 
+interface ActiveAnchorBoundary {
+	entry: any;
+	anchor: TapeAnchorData;
+}
+
+function findActiveAnchorBoundary(entries: any[]): ActiveAnchorBoundary | null {
+	let active: ActiveAnchorBoundary | null = null;
+	for (const entry of entries) {
+		if (entry?.type === "compaction") {
+			active = null;
+			continue;
+		}
+		const anchor = entry?.type === "message" ? anchorFromMessage(entry.message) : null;
+		if (anchor) active = { entry, anchor };
+	}
+	return active;
+}
+
+function contextMessagesForEntry(entry: any): any[] {
+	if (entry?.type === "message") return [entry.message];
+	if (entry?.type === "custom_message") {
+		return [{
+			role: "custom",
+			customType: entry.customType,
+			content: entry.content,
+			display: entry.display,
+			details: entry.details,
+			timestamp: new Date(entry.timestamp).getTime(),
+		}];
+	}
+	if (entry?.type === "branch_summary") {
+		return [{ role: "branchSummary", summary: entry.summary, fromId: entry.fromId, timestamp: new Date(entry.timestamp).getTime() }];
+	}
+	if (entry?.type === "compaction") {
+		return [{ role: "compactionSummary", summary: entry.summary, tokensBefore: entry.tokensBefore, timestamp: new Date(entry.timestamp).getTime() }];
+	}
+	return [];
+}
+
+function compactAwareEntries(pathEntries: any[]): any[] {
+	let latestCompactionIndex = -1;
+	for (let i = pathEntries.length - 1; i >= 0; i--) {
+		if (pathEntries[i]?.type === "compaction") {
+			latestCompactionIndex = i;
+			break;
+		}
+	}
+	if (latestCompactionIndex < 0) return pathEntries;
+
+	const compaction = pathEntries[latestCompactionIndex];
+	const firstKeptIndex = pathEntries.findIndex((entry) => entry?.id === compaction.firstKeptEntryId);
+	return [
+		compaction,
+		...(firstKeptIndex >= 0 ? pathEntries.slice(firstKeptIndex, latestCompactionIndex) : []),
+		...pathEntries.slice(latestCompactionIndex + 1),
+	];
+}
+
+function messagesFromEntries(entries: any[], start: number, end: number): any[] {
+	const messages: any[] = [];
+	for (let i = start; i < end; i++) {
+		messages.push(...contextMessagesForEntry(entries[i]));
+	}
+	return messages;
+}
+
+export function prepareProjectedAnchorCompaction(
+	branchEntries: any[],
+	settings: { keepRecentTokens: number; reserveTokens: number; enabled: boolean },
+	tokensBefore: number,
+	fileOps: any,
+): any | undefined {
+	const active = findActiveAnchorBoundary(branchEntries);
+	if (!active) return undefined;
+
+	const contextEntries = compactAwareEntries(branchEntries);
+	const anchorIndex = contextEntries.findIndex((entry: any) => entry?.id === active.entry.id);
+	if (anchorIndex < 0) return undefined;
+
+	let anchorStartIndex = anchorIndex;
+	if (anchorIndex > 0 && contextEntries[anchorIndex - 1]?.type === "message" && contextEntries[anchorIndex - 1]?.message?.role === "assistant") {
+		anchorStartIndex--;
+	}
+
+	const historyCut = findCutPoint(contextEntries, 0, anchorStartIndex, active.anchor.keepRecentTokens ?? DEFAULT_KEEP_RECENT_TOKENS);
+	const historyKeepFrom = historyCut.isSplitTurn && historyCut.turnStartIndex >= 0
+		? historyCut.turnStartIndex
+		: historyCut.firstKeptEntryIndex;
+
+	const postAnchorStart = anchorIndex + 1;
+	const hasPostAnchorCutPoint = contextEntries.slice(postAnchorStart).some((entry: any) =>
+		contextMessagesForEntry(entry).some((message: any) => message.role !== "toolResult"),
+	);
+	const recentCut = hasPostAnchorCutPoint
+		? findCutPoint(contextEntries, postAnchorStart, contextEntries.length, settings.keepRecentTokens)
+		: { firstKeptEntryIndex: anchorStartIndex, turnStartIndex: -1, isSplitTurn: false };
+	const firstKeptEntry = contextEntries[recentCut.firstKeptEntryIndex];
+	if (!firstKeptEntry?.id || contextMessagesForEntry(firstKeptEntry).every((message: any) => message.role === "toolResult")) return undefined;
+
+	const historyEnd = recentCut.isSplitTurn ? recentCut.turnStartIndex : recentCut.firstKeptEntryIndex;
+	const messagesToSummarize = [
+		makeSummaryMessage(active.anchor),
+		...messagesFromEntries(contextEntries, historyKeepFrom, anchorStartIndex),
+		...messagesFromEntries(contextEntries, postAnchorStart, historyEnd),
+	];
+	const turnPrefixMessages = recentCut.isSplitTurn
+		? messagesFromEntries(contextEntries, recentCut.turnStartIndex, recentCut.firstKeptEntryIndex)
+		: [];
+
+	return {
+		firstKeptEntryId: firstKeptEntry.id,
+		messagesToSummarize,
+		turnPrefixMessages,
+		isSplitTurn: recentCut.isSplitTurn,
+		tokensBefore,
+		previousSummary: undefined,
+		fileOps,
+		settings,
+	};
+}
+
 // ============================================================================
 // Rendering
 // ============================================================================
@@ -876,8 +1004,8 @@ export default function (pi: ExtensionAPI) {
 			limit: Type.Optional(Type.Number({ description: "Max results/lines. Default: 20 for view records, 200 for entry view, 10 for search." })),
 			offset: Type.Optional(Type.Number({ description: "Skip N records/lines. Default: 0." })),
 		}),
-		renderCall(args, theme) {
-			return renderToolCall("tape", args, theme);
+		renderCall(args, theme, context) {
+			return renderToolCall("tape", args, theme, !context.isPartial);
 		},
 		async execute(_id, params, signal, _onUpdate, ctx) {
 			const branchEntries = ctx.sessionManager.getBranch() as any[];
@@ -1117,13 +1245,49 @@ export default function (pi: ExtensionAPI) {
 		return { systemPrompt: `${event.systemPrompt}\n\n${renderNotesBlock(ctx.cwd, recent)}` };
 	});
 
+	// ── Native compaction: summarize the projected anchor context ────
+	// Core compaction prepares from the raw branch and does not run context
+	// hooks. When an anchor is the active boundary, replace that preparation
+	// with the same projected history the model actually sees.
+	pi.on("session_before_compact", async (event, ctx) => {
+		if (event.reason !== "manual" || !ctx.model) return;
+
+		const usageTokens = ctx.getContextUsage?.()?.tokens;
+		const preparation = prepareProjectedAnchorCompaction(
+			event.branchEntries as any[],
+			event.preparation.settings,
+			usageTokens ?? event.preparation.tokensBefore,
+			event.preparation.fileOps,
+		);
+		if (!preparation) return;
+
+		const auth = await ctx.modelRegistry.getApiKeyAndHeaders(ctx.model);
+		if (!auth.ok) throw new Error(`Tape compaction auth failed: ${auth.error}`);
+
+		const result = await compact(
+			preparation,
+			ctx.model,
+			auth.apiKey,
+			auth.headers,
+			event.customInstructions,
+			event.signal,
+			pi.getThinkingLevel(),
+			undefined,
+			auth.env,
+		);
+		return { compaction: result };
+	});
+
 	// ── Context hook: rebuild context from latest anchor ─────────────
-	pi.on("context", async (event) => {
+	pi.on("context", async (event, ctx) => {
 		const messages = event.messages as any[];
 		if (!messages || messages.length === 0) return;
 
+		const active = findActiveAnchorBoundary(ctx.sessionManager.getBranch() as any[]);
+		if (!active) return;
+
 		const latest = findLatestAnchorIndex(messages);
-		if (!latest) return;
+		if (!latest || latest.anchor.name !== active.anchor.name || latest.anchor.createdAt !== active.anchor.createdAt) return;
 
 		const { index: anchorIdx, anchor } = latest;
 		const keepTokens = anchor.keepRecentTokens ?? DEFAULT_KEEP_RECENT_TOKENS;
