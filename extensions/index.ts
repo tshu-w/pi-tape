@@ -34,8 +34,6 @@ import { StringEnum } from "@earendil-works/pi-ai";
 import {
 	buildContextEntries,
 	compact,
-	DEFAULT_MAX_BYTES,
-	DEFAULT_MAX_LINES,
 	findCutPoint,
 	getAgentDir,
 	sessionEntryToContextMessages,
@@ -44,6 +42,7 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { renderToolCall } from "./render-call.js";
+import { withToolOutputContract } from "./tool-output.js";
 
 // ============================================================================
 // Constants
@@ -104,7 +103,6 @@ interface SearchItem {
 	kind: SearchKind;
 	role: string;
 	searchableText: string;
-	payload: Record<string, unknown>;
 	timestamp: string;
 	sessionFile?: string;
 	sessionCwd?: string;
@@ -117,7 +115,6 @@ interface SearchResult {
 	kind: SearchKind;
 	role: string;
 	preview: string;
-	payload: Record<string, unknown>;
 	sessionFile?: string;
 	sessionCwd?: string;
 	sourceSessionFile?: string;
@@ -478,25 +475,6 @@ function scanTapeRecords(scope: "cwd" | "all", cwd: string, sessionDir: string |
 // Entry content extraction (for search)
 // ============================================================================
 
-function contentPayload(content: string): Record<string, unknown> {
-	const truncated = truncateHead(content, { maxLines: DEFAULT_MAX_LINES, maxBytes: DEFAULT_MAX_BYTES });
-	return { content: truncated.content, truncated: truncated.truncated };
-}
-
-function recordPayload(record: TapeRecord): Record<string, unknown> {
-	const truncated = truncateHead(record.summary, { maxLines: DEFAULT_MAX_LINES, maxBytes: DEFAULT_MAX_BYTES });
-	return {
-		entryId: record.entryId,
-		timestamp: record.timestamp,
-		name: record.name,
-		summary: truncated.content,
-		sessionFile: record.sessionFile,
-		sessionCwd: record.sessionCwd,
-		sourceSessionFile: record.sourceSessionFile,
-		truncated: truncated.truncated,
-	};
-}
-
 function stringifyContentBlocks(content: any[]): string {
 	return content
 		.map((block: any) => {
@@ -514,7 +492,6 @@ function searchItemForRecord(record: TapeRecord): SearchItem {
 		kind: record.kind,
 		role: record.kind,
 		searchableText: `${record.name}\n${record.summary}`,
-		payload: recordPayload(record),
 		timestamp: record.timestamp,
 		sessionFile: record.sessionFile,
 		sessionCwd: record.sessionCwd,
@@ -543,22 +520,22 @@ function extractSearchItems(entry: any, sessionFile?: string, sessionCwd?: strin
 				content = stringifyContentBlocks(msg.content);
 			}
 			const role = msg.toolName ? `toolResult:${msg.toolName}` : "toolResult";
-			return content ? [{ kind: "tool_result", role, searchableText: content, payload: contentPayload(content), timestamp, sessionFile, sessionCwd }] : [];
+			return content ? [{ kind: "tool_result", role, searchableText: content, timestamp, sessionFile, sessionCwd }] : [];
 		}
 
 		if (msg.role === "assistant") {
 			const items: SearchItem[] = [];
 			if (typeof msg.content === "string") {
-				if (msg.content) items.push({ kind: "message", role: "assistant", searchableText: msg.content, payload: contentPayload(msg.content), timestamp, sessionFile, sessionCwd });
+				if (msg.content) items.push({ kind: "message", role: "assistant", searchableText: msg.content, timestamp, sessionFile, sessionCwd });
 			} else if (Array.isArray(msg.content)) {
 				const textContent = stringifyContentBlocks(msg.content);
-				if (textContent) items.push({ kind: "message", role: "assistant", searchableText: textContent, payload: contentPayload(textContent), timestamp, sessionFile, sessionCwd });
+				if (textContent) items.push({ kind: "message", role: "assistant", searchableText: textContent, timestamp, sessionFile, sessionCwd });
 
 				const toolCalls = msg.content
 					.filter((block: any) => block?.type === "toolCall" && !SEARCH_INTERNAL_TOOL_NAMES.has(block.name))
 					.map((block: any) => `${block.name}(${JSON.stringify(block.arguments)})`)
 					.join(" ");
-				if (toolCalls) items.push({ kind: "tool_call", role: "assistant", searchableText: toolCalls, payload: contentPayload(toolCalls), timestamp, sessionFile, sessionCwd });
+				if (toolCalls) items.push({ kind: "tool_call", role: "assistant", searchableText: toolCalls, timestamp, sessionFile, sessionCwd });
 			}
 			return items;
 		}
@@ -571,13 +548,13 @@ function extractSearchItems(entry: any, sessionFile?: string, sessionCwd?: strin
 			content = stringifyContentBlocks(msg.content);
 		}
 		if (msg.summary) content = msg.summary;
-		return content ? [{ kind: "message", role, searchableText: content, payload: contentPayload(content), timestamp, sessionFile, sessionCwd }] : [];
+		return content ? [{ kind: "message", role, searchableText: content, timestamp, sessionFile, sessionCwd }] : [];
 	}
 	if (entry.type === "custom_message" && typeof entry.content === "string" && entry.content) {
-		return [{ kind: "custom", role: "custom", searchableText: entry.content, payload: contentPayload(entry.content), timestamp, sessionFile, sessionCwd }];
+		return [{ kind: "custom", role: "custom", searchableText: entry.content, timestamp, sessionFile, sessionCwd }];
 	}
 	if (entry.type === "branch_summary" && entry.summary) {
-		return [{ kind: "summary", role: "branchSummary", searchableText: entry.summary, payload: contentPayload(entry.summary), timestamp, sessionFile, sessionCwd }];
+		return [{ kind: "summary", role: "branchSummary", searchableText: entry.summary, timestamp, sessionFile, sessionCwd }];
 	}
 	return [];
 }
@@ -631,7 +608,6 @@ function matchEntries(entries: any[], query: QueryExpr, kinds: SearchKind[], tim
 				kind: item.kind,
 				role: item.role,
 				preview: makePreview(item.searchableText, term),
-				payload: item.payload,
 				sessionFile: item.sessionFile,
 				sessionCwd: item.sessionCwd,
 				sourceSessionFile: item.sourceSessionFile,
@@ -921,7 +897,7 @@ function renderEntryView(entry: any, offset: number, limit: number): string {
 // ============================================================================
 
 export default function (pi: ExtensionAPI) {
-	pi.registerTool({
+	pi.registerTool(withToolOutputContract({
 		name: "tape",
 		label: "Tape",
 		description: [
@@ -996,7 +972,12 @@ export default function (pi: ExtensionAPI) {
 					}
 					return {
 						content: [{ type: "text", text: lines.join("\n") }],
-						details: { branchAnchors: currentBranchAnchors.length, sessionAnchors: sessionAnchors.length, latest, usage },
+						details: {
+						branchAnchors: currentBranchAnchors.length,
+						sessionAnchors: sessionAnchors.length,
+						latest: latest ? { entryId: latest.entryId, name: latest.name, timestamp: latest.timestamp } : undefined,
+						usage,
+					},
 					};
 				}
 
@@ -1173,7 +1154,7 @@ export default function (pi: ExtensionAPI) {
 
 					return {
 						content: [{ type: "text", text: renderSearchResults(page, total, offset, query, kinds, timeFilterLabel, sessionFile, scope === "cwd" || scope === "all") }],
-						details: { results: page, total, scope, kinds, query, start: params.start, end: params.end, offset, limit },
+						details: { results: page, total, offset, limit },
 					};
 				}
 
@@ -1181,7 +1162,7 @@ export default function (pi: ExtensionAPI) {
 					return { content: [{ type: "text", text: `Unknown action: ${params.action}` }], details: {} };
 			}
 		},
-	});
+	}));
 
 	// ── Notes + recent anchors: system prompt injection ──────────────
 	// Cross-session anchors are scanned once per session (rescanned when the
