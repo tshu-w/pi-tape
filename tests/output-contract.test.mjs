@@ -3,10 +3,11 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import test from "node:test";
+import {
+	DEFAULT_MAX_BYTES as MAX_BYTES,
+	DEFAULT_MAX_LINES as MAX_LINES,
+} from "@earendil-works/pi-coding-agent";
 import { anchorEntry, loadTape, makeCtx, textMessage } from "./harness.mjs";
-
-const MAX_BYTES = 50 * 1024;
-const MAX_LINES = 2000;
 
 function assertBounded(result) {
 	const text = result.content.filter((part) => part.type === "text").map((part) => part.text).join("\n");
