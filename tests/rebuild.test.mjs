@@ -67,6 +67,30 @@ test("window never starts with a toolResult", async () => {
 	assert.notEqual(result.messages[1].role, "toolResult");
 });
 
+test("anchor history budget starts before the full parallel tool batch", async () => {
+	const recentHistory = textMessage("user", "recent history must survive", 2000);
+	const recentReply = textMessage("assistant", "acknowledged", 2001);
+	const anchorRequest = textMessage("user", "create the checkpoint", 2002);
+	const assistant = {
+		role: "assistant",
+		content: [
+			{ type: "toolCall", id: "large-call", name: "read", arguments: { path: "large.log" } },
+			{ type: "toolCall", id: "anchor-call", name: "tape", arguments: { action: "anchor" } },
+		],
+		timestamp: 2003,
+	};
+	const parallelResult = { role: "toolResult", toolCallId: "large-call", toolName: "read", content: [{ type: "text", text: big }], timestamp: 2004 };
+	const anchorResult = { ...anchor("a1", 100), toolCallId: "anchor-call" };
+	const messages = [...longConversation(4), recentHistory, recentReply, anchorRequest, assistant, parallelResult, anchorResult];
+
+	const result = await rebuild(messages);
+	assert.ok(result);
+	assert.ok(result.messages.includes(recentHistory));
+	assert.ok(result.messages.includes(assistant));
+	assert.ok(result.messages.includes(parallelResult));
+	assert.ok(result.messages.includes(anchorResult));
+});
+
 test("latest anchor governs when several exist", async () => {
 	const messages = [
 		...longConversation(10),

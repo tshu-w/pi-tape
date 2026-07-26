@@ -80,7 +80,23 @@ test("anchor result carries the summary; system prompt snapshot stays frozen", a
 	assert.ok(!second.content[0].text.includes("[second-topic]"), "current anchor is only in the title");
 });
 
-test("snapshot rescans when the session file changes", async () => {
+test("snapshot stays frozen when an ephemeral session first gets a file", async () => {
+	const { handlers: isolatedHandlers } = await loadTape();
+	const sessionId = "new-session-id";
+	const initialCtx = makeCtx({ cwd, sessionId, sessionFile: undefined, entries: [] });
+	const initial = (await isolatedHandlers.before_agent_start({ type: "before_agent_start", prompt: "hi", systemPrompt: "SYS" }, initialCtx)).systemPrompt;
+
+	const allocatedFile = writeSession(agentDir, "--fake--", "allocated.jsonl", cwd, [
+		anchorEntry({ id: "allocated-anchor", name: "created-mid-session", summary: "New work.", cwd, createdAt: "2026-07-19T10:00:00.000Z" }),
+	]);
+	const allocatedCtx = makeCtx({ cwd, sessionId, sessionFile: allocatedFile, entries: [] });
+	const afterAllocation = (await isolatedHandlers.before_agent_start({ type: "before_agent_start", prompt: "hi", systemPrompt: "SYS" }, allocatedCtx)).systemPrompt;
+	assert.equal(afterAllocation, initial);
+	assert.ok(!afterAllocation.includes("created-mid-session"));
+	fs.unlinkSync(allocatedFile);
+});
+
+test("snapshot rescans when the session identity changes", async () => {
 	writeSession(agentDir, "--fake--", "later.jsonl", cwd, [
 		anchorEntry({ id: "cccc3333-0000", name: "later-topic", summary: "Later work.", cwd, createdAt: "2026-07-20T10:00:00.000Z" }),
 	]);

@@ -8,8 +8,9 @@
  * compact-compatible points (never starting from a toolResult).
  *
  * Native compaction coexists with anchors — whichever boundary is later
- * effectively wins. An active anchor rebuilds model context; manual native
- * compaction summarizes that projected context rather than the raw branch.
+ * effectively wins. An active anchor rebuilds model context; native
+ * compaction (manual or automatic) summarizes that projected context rather
+ * than the raw branch.
  *
  * Recall follows grep -> read: search returns bounded previews; full
  * content is read via view(entryId) with line pagination. Tape's own
@@ -56,7 +57,6 @@ const RECENT_ANCHORS_LIMIT = 10;
 const SEARCH_PREVIEW_LENGTH = 200;
 const DEFAULT_SEARCH_KINDS = ["message", "tool_result"] as const;
 const SEARCH_KINDS = ["message", "tool_result", "tool_call", "anchor", "compact", "summary", "custom"] as const;
-const SEARCH_KINDS_SET = new Set<string>(SEARCH_KINDS);
 const DEFAULT_SEARCH_KINDS_SET = new Set<string>(DEFAULT_SEARCH_KINDS);
 const SEARCH_INTERNAL_TOOL_NAMES = new Set(["tape"]);
 
@@ -131,25 +131,41 @@ function getSessionsDir(): string {
 	return path.join(getAgentDir(), "sessions");
 }
 
-function listSessionFiles(): Array<{ file: string; mtime: number }> {
-	const sessionsDir = getSessionsDir();
-	if (!fs.existsSync(sessionsDir)) return [];
-
+function sessionFilesInDir(dir: string): Array<{ file: string; mtime: number }> {
+	if (!fs.existsSync(dir)) return [];
 	const files: Array<{ file: string; mtime: number }> = [];
-	for (const dirent of fs.readdirSync(sessionsDir, { withFileTypes: true })) {
-		if (!dirent.isDirectory()) continue;
-		const subdirPath = path.join(sessionsDir, dirent.name);
+	for (const name of fs.readdirSync(dir)) {
+		if (!name.endsWith(".jsonl")) continue;
+		const file = path.join(dir, name);
+		try {
+			files.push({ file, mtime: fs.statSync(file).mtimeMs });
+		} catch { /* skip */ }
+	}
+	return files;
+}
 
-		for (const name of fs.readdirSync(subdirPath)) {
-			if (!name.endsWith(".jsonl")) continue;
-			const file = path.join(subdirPath, name);
-			try {
-				files.push({ file, mtime: fs.statSync(file).mtimeMs });
-			} catch { /* skip */ }
+function listSessionFiles(sessionDir?: string, sessionFile?: string): Array<{ file: string; mtime: number }> {
+	const defaultRoot = getSessionsDir();
+	const resolvedSessionDir = sessionDir ? resolvedFilePath(sessionDir) : undefined;
+	const usesDefaultLayout = resolvedSessionDir && path.dirname(resolvedSessionDir) === resolvedFilePath(defaultRoot);
+	const files = new Map<string, { file: string; mtime: number }>();
+	const add = (item: { file: string; mtime: number }) => files.set(resolvedFilePath(item.file), item);
+
+	// The default root remains part of scope=all/cwd even when the active
+	// session uses a custom directory; add that custom directory as a second
+	// source rather than replacing the user's regular history.
+	if (fs.existsSync(defaultRoot)) {
+		for (const dirent of fs.readdirSync(defaultRoot, { withFileTypes: true })) {
+			if (!dirent.isDirectory()) continue;
+			for (const item of sessionFilesInDir(path.join(defaultRoot, dirent.name))) add(item);
 		}
 	}
-	files.sort((a, b) => b.mtime - a.mtime);
-	return files;
+	if (resolvedSessionDir && !usesDefaultLayout) {
+		for (const item of sessionFilesInDir(resolvedSessionDir)) add(item);
+	}
+
+	if (sessionFile) add({ file: sessionFile, mtime: Number.POSITIVE_INFINITY });
+	return [...files.values()].sort((a, b) => b.mtime - a.mtime);
 }
 
 function parseSessionFile(file: string): { cwd?: string; entries: any[] } | null {
@@ -285,11 +301,6 @@ function normalizeTimestamp(timestamp: unknown): string {
 	return "";
 }
 
-function timestampToMs(timestamp: string): number {
-	if (!timestamp) return Number.NaN;
-	return Date.parse(timestamp);
-}
-
 function parseFilterTimestamp(value: unknown, name: string): { value?: number; error?: string } {
 	if (value == null) return {};
 	if (typeof value !== "string" || !value.trim()) return { error: `\`${name}\` must be a timestamp string.` };
@@ -305,7 +316,7 @@ function parseFilterTimestamp(value: unknown, name: string): { value?: number; e
 
 function matchesTimeFilter(timestamp: string, filter: TimeFilter): boolean {
 	if (filter.start == null && filter.end == null) return true;
-	const ms = timestampToMs(timestamp);
+	const ms = Date.parse(timestamp);
 	if (Number.isNaN(ms)) return false;
 	if (filter.start != null && ms < filter.start) return false;
 	if (filter.end != null && ms > filter.end) return false;
@@ -375,12 +386,7 @@ function compactFromEntry(entry: any, sessionFile?: string, sessionCwd?: string)
 }
 
 function anchorRecordsFromEntries(entries: any[], sessionFile?: string, sessionCwd?: string): TapeRecord[] {
-	const anchors: TapeRecord[] = [];
-	for (const entry of entries) {
-		const anchor = anchorFromEntry(entry, sessionFile, sessionCwd);
-		if (anchor) anchors.push(anchor);
-	}
-	return anchors;
+	return tapeRecordsFromEntries(entries, sessionFile, sessionCwd).filter((record) => record.kind === "anchor");
 }
 
 function tapeRecordsFromEntries(entries: any[], sessionFile?: string, sessionCwd?: string): TapeRecord[] {
@@ -435,13 +441,13 @@ function saveRecordIndex(files: Record<string, RecordIndexEntry>): void {
  * only new or modified files are re-parsed. The current session is always
  * read live from memory. Full-text search is unaffected (it needs entries).
  */
-function scanTapeRecords(scope: "cwd" | "all", cwd: string, sessionFile: string | undefined, sessionEntries: any[], signal?: AbortSignal): TapeRecord[] {
+function scanTapeRecords(scope: "cwd" | "all", cwd: string, sessionDir: string | undefined, sessionFile: string | undefined, sessionEntries: any[], signal?: AbortSignal): TapeRecord[] {
 	const index = loadRecordIndex();
 	const next: Record<string, RecordIndexEntry> = {};
 	let dirty = false;
 	const records: TapeRecord[] = [];
 
-	for (const item of listSessionFiles()) {
+	for (const item of listSessionFiles(sessionDir, sessionFile)) {
 		if (signal?.aborted) break;
 
 		if (isCurrentSessionFile(item.file, sessionFile)) {
@@ -472,18 +478,13 @@ function scanTapeRecords(scope: "cwd" | "all", cwd: string, sessionFile: string 
 // Entry content extraction (for search)
 // ============================================================================
 
-function truncateSearchText(text: string): { content: string; truncated: boolean } {
-	const truncation = truncateHead(text, { maxLines: DEFAULT_MAX_LINES, maxBytes: DEFAULT_MAX_BYTES });
-	return { content: truncation.content, truncated: truncation.truncated };
-}
-
 function contentPayload(content: string): Record<string, unknown> {
-	const truncated = truncateSearchText(content);
+	const truncated = truncateHead(content, { maxLines: DEFAULT_MAX_LINES, maxBytes: DEFAULT_MAX_BYTES });
 	return { content: truncated.content, truncated: truncated.truncated };
 }
 
 function recordPayload(record: TapeRecord): Record<string, unknown> {
-	const truncated = truncateSearchText(record.summary);
+	const truncated = truncateHead(record.summary, { maxLines: DEFAULT_MAX_LINES, maxBytes: DEFAULT_MAX_BYTES });
 	return {
 		entryId: record.entryId,
 		timestamp: record.timestamp,
@@ -581,18 +582,8 @@ function extractSearchItems(entry: any, sessionFile?: string, sessionCwd?: strin
 	return [];
 }
 
-function normalizeSearchKinds(kinds: unknown): SearchKind[] {
-	if (!Array.isArray(kinds) || kinds.length === 0) return [...DEFAULT_SEARCH_KINDS];
-	const normalized: SearchKind[] = [];
-	const seen = new Set<SearchKind>();
-	for (const kind of kinds) {
-		if (typeof kind !== "string" || !SEARCH_KINDS_SET.has(kind)) continue;
-		const searchKind = kind as SearchKind;
-		if (seen.has(searchKind)) continue;
-		seen.add(searchKind);
-		normalized.push(searchKind);
-	}
-	return normalized;
+function normalizeSearchKinds(kinds?: SearchKind[]): SearchKind[] {
+	return kinds?.length ? [...new Set(kinds)] : [...DEFAULT_SEARCH_KINDS];
 }
 
 function parseQuery(query: string): QueryExpr {
@@ -612,15 +603,8 @@ function matchingQueryTerm(content: string, query: QueryExpr): string | undefine
 	return undefined;
 }
 
-function matchesQuery(text: string, query: QueryExpr): boolean {
-	if (query.length === 0) return true;
-	return matchingQueryTerm(text, query) !== undefined;
-}
-
-function makePreview(content: string, query: QueryExpr): string {
-	const term = matchingQueryTerm(content, query);
-	const lower = content.toLowerCase();
-	const matchIdx = term ? lower.indexOf(term) : 0;
+function makePreview(content: string, term: string | undefined): string {
+	const matchIdx = term ? content.toLowerCase().indexOf(term) : 0;
 	const start = Math.max(0, matchIdx - 50);
 	const end = Math.min(content.length, start + SEARCH_PREVIEW_LENGTH);
 	let preview = content.slice(start, end).replace(/\n/g, " ");
@@ -638,14 +622,15 @@ function matchEntries(entries: any[], query: QueryExpr, kinds: SearchKind[], tim
 		for (const item of extractSearchItems(entry, sessionFile, sessionCwd)) {
 			if (!allowedKinds.has(item.kind)) continue;
 			if (!matchesTimeFilter(item.timestamp, timeFilter)) continue;
-			if (!matchesQuery(item.searchableText, query)) continue;
+			const term = matchingQueryTerm(item.searchableText, query);
+			if (query.length > 0 && term === undefined) continue;
 
 			results.push({
 				entryId,
 				timestamp: item.timestamp,
 				kind: item.kind,
 				role: item.role,
-				preview: makePreview(item.searchableText, query),
+				preview: makePreview(item.searchableText, term),
 				payload: item.payload,
 				sessionFile: item.sessionFile,
 				sessionCwd: item.sessionCwd,
@@ -658,34 +643,12 @@ function matchEntries(entries: any[], query: QueryExpr, kinds: SearchKind[], tim
 	return results;
 }
 
-function recordDedupeKey(record: TapeRecord): string {
-	if (record.kind === "anchor") {
-		return `${record.kind}:${record.sourceSessionFile ?? record.sessionFile ?? ""}:${record.entryId}`;
-	}
-	return `${record.kind}:${record.entryId}:${record.timestamp}`;
-}
-
-function searchResultDedupeKey(result: SearchResult): string {
-	if (result.kind === "anchor") {
-		return `${result.kind}:${result.sourceSessionFile ?? result.sessionFile ?? ""}:${result.entryId}`;
-	}
-	return `${result.kind}:${result.entryId}:${result.timestamp}`;
-}
-
-function dedupeTapeRecords(records: TapeRecord[]): TapeRecord[] {
+function dedupeRecords<T extends { kind: string; entryId: string; timestamp?: string; sessionFile?: string; sourceSessionFile?: string }>(records: T[]): T[] {
 	const seen = new Set<string>();
 	return records.filter((record) => {
-		const key = recordDedupeKey(record);
-		if (seen.has(key)) return false;
-		seen.add(key);
-		return true;
-	});
-}
-
-function dedupeSearchResults(results: SearchResult[]): SearchResult[] {
-	const seen = new Set<string>();
-	return results.filter((result) => {
-		const key = searchResultDedupeKey(result);
+		const key = record.kind === "anchor"
+			? `${record.kind}:${record.sourceSessionFile ?? record.sessionFile ?? ""}:${record.entryId}`
+			: `${record.kind}:${record.entryId}:${record.timestamp}`;
 		if (seen.has(key)) return false;
 		seen.add(key);
 		return true;
@@ -728,6 +691,33 @@ function findLatestAnchorIndex(messages: any[]): { index: number; anchor: TapeAn
 		if (anchor) return { index: i, anchor };
 	}
 	return null;
+}
+
+function findAnchorToolCallStartIndex(messages: any[], anchorIndex: number): number {
+	const toolCallId = messages[anchorIndex]?.toolCallId;
+	for (let i = anchorIndex - 1; i >= 0; i--) {
+		const message = messages[i];
+		if (message?.role === "assistant") {
+			if (!toolCallId) return i;
+			const hasMatchingCall = Array.isArray(message.content) && message.content.some(
+				(block: any) => block?.type === "toolCall" && block.id === toolCallId,
+			);
+			return hasMatchingCall ? i : anchorIndex;
+		}
+		if (message?.role !== "toolResult") return anchorIndex;
+	}
+	return anchorIndex;
+}
+
+function findAnchorToolCallStartEntryIndex(entries: any[], anchorIndex: number): number {
+	const flattened: Array<{ entryIndex: number; message: any }> = [];
+	for (let i = 0; i <= anchorIndex; i++) {
+		for (const message of sessionEntryToContextMessages(entries[i])) flattened.push({ entryIndex: i, message });
+	}
+	const flattenedAnchorIndex = flattened.findLastIndex(({ entryIndex, message }) => entryIndex === anchorIndex && !!anchorFromMessage(message));
+	if (flattenedAnchorIndex < 0) return anchorIndex;
+	const start = findAnchorToolCallStartIndex(flattened.map(({ message }) => message), flattenedAnchorIndex);
+	return flattened[start]?.entryIndex ?? anchorIndex;
 }
 
 function makeSummaryMessage(anchor: TapeAnchorData): any {
@@ -779,10 +769,7 @@ export function prepareProjectedAnchorCompaction(
 	const anchorIndex = contextEntries.findIndex((entry: any) => entry?.id === active.entry.id);
 	if (anchorIndex < 0) return undefined;
 
-	let anchorStartIndex = anchorIndex;
-	if (anchorIndex > 0 && contextEntries[anchorIndex - 1]?.type === "message" && contextEntries[anchorIndex - 1]?.message?.role === "assistant") {
-		anchorStartIndex--;
-	}
+	const anchorStartIndex = findAnchorToolCallStartEntryIndex(contextEntries, anchorIndex);
 
 	const historyCut = findCutPoint(contextEntries, 0, anchorStartIndex, active.anchor.keepRecentTokens ?? DEFAULT_KEEP_RECENT_TOKENS);
 	const historyKeepFrom = historyCut.isSplitTurn && historyCut.turnStartIndex >= 0
@@ -903,7 +890,7 @@ function renderSearchResults(results: SearchResult[], total: number, offset: num
 	if (results.length === 0) return `No entries matching ${queryLabel}${suffix} (offset ${offset}).`;
 	const lines = results.map((r) => {
 		const metadata = [
-			...(showSessionLabel ? [`session=${sessionLabel(r, currentSessionFile)}`] : []),
+			...(showSessionLabel ? [`session=${sessionLabel(r, currentSessionFile)}`, `sessionFile=${JSON.stringify(r.sessionFile ?? "")}`] : []),
 			`time=${formatTimestampSecond(r.timestamp)}`,
 		].join(" ");
 		return `- [${r.entryId.slice(0, 8)}] ${r.kind}/${r.role} ${metadata}\n  ${r.preview}`;
@@ -911,16 +898,16 @@ function renderSearchResults(results: SearchResult[], total: number, offset: num
 	return `search ${queryLabel}${suffix} (${results.length}/${total}, offset ${offset})\n${lines.join("\n\n")}`;
 }
 
-function entryViewText(entry: any, sessionFile?: string, sessionCwd?: string): string {
-	const items = extractSearchItems(entry, sessionFile, sessionCwd);
+function entryViewText(entry: any): string {
+	const items = extractSearchItems(entry);
 	if (items.length > 0) {
 		return items.map((item) => `## ${item.kind}/${item.role}\n${item.searchableText}`).join("\n\n");
 	}
 	return JSON.stringify(entry, null, 2);
 }
 
-function renderEntryView(entry: any, sessionFile: string | undefined, sessionCwd: string | undefined, offset: number, limit: number): string {
-	const text = entryViewText(entry, sessionFile, sessionCwd);
+function renderEntryView(entry: any, offset: number, limit: number): string {
+	const text = entryViewText(entry);
 	const lines = text.split("\n");
 	const start = Math.min(offset, lines.length);
 	const end = Math.min(lines.length, start + limit);
@@ -979,6 +966,7 @@ export default function (pi: ExtensionAPI) {
 		async execute(_id, params, signal, _onUpdate, ctx) {
 			const branchEntries = ctx.sessionManager.getBranch() as any[];
 			const sessionEntries = ctx.sessionManager.getEntries() as any[];
+			const sessionDir = ctx.sessionManager.getSessionDir();
 			const sessionFile = ctx.sessionManager.getSessionFile();
 
 			switch (params.action) {
@@ -1043,7 +1031,7 @@ export default function (pi: ExtensionAPI) {
 						},
 					};
 
-					const priorAnchors = [...currentBranchAnchors].reverse().slice(0, RECENT_ANCHORS_LIMIT);
+					const priorAnchors = currentBranchAnchors.slice(-RECENT_ANCHORS_LIMIT).reverse();
 					const priorLine = priorAnchors.length > 0
 						? `\n\nrecent anchors (this session): ${priorAnchors.map(anchorItemLabel).join(" · ")}`
 						: "";
@@ -1077,7 +1065,7 @@ export default function (pi: ExtensionAPI) {
 						} else if (scope === "session") {
 							addMatches(sessionEntries, sessionFile, ctx.cwd);
 						} else {
-							for (const item of listSessionFiles()) {
+							for (const item of listSessionFiles(sessionDir, sessionFile)) {
 								if (signal?.aborted) break;
 								const parsed = sessionEntriesForScan(item, sessionFile, sessionEntries, ctx.cwd);
 								if (!parsed) continue;
@@ -1096,7 +1084,7 @@ export default function (pi: ExtensionAPI) {
 
 						const found = candidates[0];
 						return {
-							content: [{ type: "text", text: renderEntryView(found.entry, found.file, found.cwd, offset, Math.max(1, limit)) }],
+							content: [{ type: "text", text: renderEntryView(found.entry, offset, Math.max(1, limit)) }],
 							details: { entryId: found.entry.id, sessionFile: found.file, sessionCwd: found.cwd, offset, limit },
 						};
 					}
@@ -1128,10 +1116,10 @@ export default function (pi: ExtensionAPI) {
 					}
 
 					// cwd or all — scan session files (index-cached)
-					const allRecords = scanTapeRecords(scope, ctx.cwd, sessionFile, sessionEntries, signal);
+					const allRecords = scanTapeRecords(scope, ctx.cwd, sessionDir, sessionFile, sessionEntries, signal);
 
 					allRecords.sort((a, b) => (b.timestamp || "").localeCompare(a.timestamp || ""));
-					const dedupedRecords = dedupeTapeRecords(allRecords);
+					const dedupedRecords = dedupeRecords(allRecords);
 					const total = dedupedRecords.length;
 					const page = dedupedRecords.slice(offset, offset + limit);
 
@@ -1168,7 +1156,7 @@ export default function (pi: ExtensionAPI) {
 						allMatches = matchEntries(sessionEntries, queryExpr, kinds, timeFilter, sessionFile, ctx.cwd);
 					} else {
 						allMatches = [];
-						for (const item of listSessionFiles()) {
+						for (const item of listSessionFiles(sessionDir, sessionFile)) {
 							if (signal?.aborted) break;
 							const parsed = sessionEntriesForScan(item, sessionFile, sessionEntries, ctx.cwd);
 							if (!parsed) continue;
@@ -1179,7 +1167,7 @@ export default function (pi: ExtensionAPI) {
 
 					// Newest first
 					allMatches.sort((a, b) => (b.timestamp || "").localeCompare(a.timestamp || ""));
-					const dedupedMatches = dedupeSearchResults(allMatches);
+					const dedupedMatches = dedupeRecords(allMatches);
 					const total = dedupedMatches.length;
 					const page = dedupedMatches.slice(offset, offset + limit);
 
@@ -1197,23 +1185,25 @@ export default function (pi: ExtensionAPI) {
 
 	// ── Notes + recent anchors: system prompt injection ──────────────
 	// Cross-session anchors are scanned once per session (rescanned when the
-	// session file changes, e.g. /new or resume), backed by the mtime-keyed
+	// session identity changes, e.g. /new or resume), backed by the mtime-keyed
 	// record index so unchanged files are not re-parsed. The snapshot is
 	// deliberately frozen: anchors created mid-session are shown by the
 	// anchor tool result instead, so the system prompt — the head of the
 	// prompt-cache prefix — stays byte-identical across turns. Notes files
 	// are re-read each turn — unchanged content yields an identical prompt,
 	// so prompt caching is unaffected.
-	let anchorSnapshot: { sessionFile: string | undefined; recent: TapeRecord[] } | null = null;
+	let anchorSnapshot: { sessionId: string; recent: TapeRecord[] } | null = null;
 
 	pi.on("before_agent_start", async (event, ctx) => {
+		const sessionId = ctx.sessionManager.getSessionId();
+		const sessionDir = ctx.sessionManager.getSessionDir();
 		const sessionFile = ctx.sessionManager.getSessionFile();
 
-		if (anchorSnapshot === null || anchorSnapshot.sessionFile !== sessionFile) {
-			const anchors = scanTapeRecords("cwd", ctx.cwd, sessionFile, [], undefined)
+		if (anchorSnapshot === null || anchorSnapshot.sessionId !== sessionId) {
+			const anchors = scanTapeRecords("cwd", ctx.cwd, sessionDir, sessionFile, ctx.sessionManager.getEntries() as any[], undefined)
 				.filter((record) => record.kind === "anchor")
 				.sort((a, b) => (b.timestamp || "").localeCompare(a.timestamp || ""));
-			anchorSnapshot = { sessionFile, recent: dedupeTapeRecords(anchors).slice(0, RECENT_ANCHORS_LIMIT) };
+			anchorSnapshot = { sessionId, recent: dedupeRecords(anchors).slice(0, RECENT_ANCHORS_LIMIT) };
 		}
 
 		return { systemPrompt: `${event.systemPrompt}\n\n${renderNotesBlock(ctx.cwd, anchorSnapshot.recent)}` };
@@ -1224,7 +1214,7 @@ export default function (pi: ExtensionAPI) {
 	// hooks. When an anchor is the active boundary, replace that preparation
 	// with the same projected history the model actually sees.
 	pi.on("session_before_compact", async (event, ctx) => {
-		if (event.reason !== "manual" || !ctx.model) return;
+		if (!ctx.model) return;
 
 		const usageTokens = ctx.getContextUsage?.()?.tokens;
 		const preparation = prepareProjectedAnchorCompaction(
@@ -1246,7 +1236,7 @@ export default function (pi: ExtensionAPI) {
 			event.customInstructions,
 			event.signal,
 			pi.getThinkingLevel(),
-			undefined,
+			undefined, // ExtensionContext does not expose the active agent streamFn.
 			auth.env,
 		);
 		return { compaction: result };
@@ -1266,11 +1256,9 @@ export default function (pi: ExtensionAPI) {
 		const { index: anchorIdx, anchor } = latest;
 		const keepTokens = anchor.keepRecentTokens ?? DEFAULT_KEEP_RECENT_TOKENS;
 
-		// Find where the anchor starts (include its assistant toolCall message)
-		let anchorStartIdx = anchorIdx;
-		if (anchorIdx > 0 && messages[anchorIdx - 1]?.role === "assistant") {
-			anchorStartIdx = anchorIdx - 1;
-		}
+		// Include the whole assistant tool-call batch, even when sibling results
+		// appear before the anchor result in parallel tool mode.
+		const anchorStartIdx = findAnchorToolCallStartIndex(messages, anchorIdx);
 
 		// Calculate a compact-compatible cut point before the anchor.
 		// This keeps the transcript valid by never starting from a toolResult.

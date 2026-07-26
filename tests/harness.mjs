@@ -30,12 +30,14 @@ export async function loadTape() {
 	return { tools, handlers };
 }
 
-export function makeCtx({ cwd, sessionFile, branch = [], entries = branch }) {
+export function makeCtx({ cwd, sessionFile, sessionDir = sessionFile ? path.dirname(sessionFile) : undefined, sessionId = sessionFile ?? "ephemeral-session", branch = [], entries = branch }) {
 	return {
 		cwd,
 		sessionManager: {
 			getBranch: () => branch,
 			getEntries: () => entries,
+			getSessionDir: () => sessionDir,
+			getSessionId: () => sessionId,
 			getSessionFile: () => sessionFile,
 			getLeafId: () => undefined,
 		},

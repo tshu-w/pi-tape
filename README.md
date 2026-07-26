@@ -51,14 +51,15 @@ Recall follows the grep → read pattern:
 1. `search(query=...)` returns bounded previews with entry IDs. Space means AND, `|` means OR. Optional `kinds` and `start`/`end` filters narrow results.
 2. `view(entryId=...)` displays the full entry content with line pagination (`offset`/`limit`).
 
-Cross-session searches (`scope="cwd"` or `"all"`) render `session=` and `time=` metadata per result; pass `sessionFile` (from search result details) to `view` when opening entries from other sessions.
+Cross-session searches (`scope="cwd"` or `"all"`) render `session`, complete `sessionFile`, and `time` metadata per result; pass that `sessionFile` to `view` when opening entries from other sessions.
 
 Default search kinds are `message` + `tool_result`; anchors are searchable with `kinds=["anchor"]`. Tape's own tool calls/results are excluded from search indexing to avoid echoing previous searches.
 
 ## Implementation notes
 
 - Context is rebuilt from the latest anchor: summary is injected as conversation history, followed by a window of messages kept via pi's compact cut points.
-- Native compaction and anchors coexist; the later boundary wins. Manual compaction summarizes the effective anchor-projected context, not the raw branch.
+- Native compaction and anchors coexist; the later boundary wins. Manual, threshold, and overflow compaction summarize the effective anchor-projected context, not the raw branch.
+- Anchor-projected compaction cannot forward a custom stream function because pi's `ExtensionContext` does not expose the active agent `streamFn`. Providers that require a custom stream implementation are unsupported for compaction while an anchor is active; standard provider transports are unaffected.
 - Anchor names are unique per branch; names starting with `compact/` are reserved for compact records.
 - `view` defaults to `scope='cwd'`, listing anchors and compact records across all sessions in the same working directory for cross-session discovery. `search` defaults to `scope='session'`.
 - Cross-session record listings (`view` and the injected recent-anchors list) are cached in `<agent-dir>/tape/index.json`, keyed by session-file mtime — closed session files are parsed once. Full-text `search` still scans files. The index is a disposable cache: corrupt or missing, it is rebuilt lazily.
