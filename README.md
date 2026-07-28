@@ -17,7 +17,6 @@ pi install git:github.com/tshu-w/pi-tape
 | `search` | Find old entries by query, kind, and timestamp filters |
 | `info` | Show current tape boundary, notes status, and context usage |
 
-
 ## Notes
 
 pi-tape manages two kinds of memory:
@@ -72,10 +71,3 @@ Default search kinds are `message` + `tool_result`; anchors are searchable with 
 ```bash
 npm install && npm test
 ```
-
-Tests load the real extension (node strips types natively) against a mocked
-ExtensionAPI in an isolated agent dir. `tests/rebuild.test.mjs` pins the
-context-rebuild contract from the design header: summary-first rebuild,
-compact-compatible cuts (never starting from a toolResult), and
-latest-anchor-wins. `tests/notes.test.mjs` covers notes injection, budgets,
-anchor results, and the record index.
