@@ -17,7 +17,6 @@ pi install git:github.com/tshu-w/pi-tape
 | `search` | Find old entries by query, kind, and timestamp filters |
 | `info` | Show current tape boundary, notes status, and context usage |
 
-All model-visible tool results and errors are capped at 50KB / 2000 lines. If a result is truncated, pi-tape best-effort saves the full text to a temporary file and includes its path in the result. Search returns bounded previews and location metadata; full matching payloads remain only in their source session and are read with `view`.
 
 ## Notes
 
@@ -75,9 +74,7 @@ npm install && npm test
 ```
 
 Tests load the real extension (node strips types natively) against a mocked
-ExtensionAPI in an isolated agent dir. `tests/output-contract.test.mjs` covers
-final output bounds, full-output preservation, and lean search details.
-`tests/rebuild.test.mjs` pins the
+ExtensionAPI in an isolated agent dir. `tests/rebuild.test.mjs` pins the
 context-rebuild contract from the design header: summary-first rebuild,
 compact-compatible cuts (never starting from a toolResult), and
 latest-anchor-wins. `tests/notes.test.mjs` covers notes injection, budgets,
