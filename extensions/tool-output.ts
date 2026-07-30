@@ -1,4 +1,4 @@
-import type { AgentToolResult, ToolDefinition } from "@earendil-works/pi-coding-agent";
+import type { AgentToolResult, ToolDefinition, TruncationResult } from "@earendil-works/pi-coding-agent";
 import { DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, formatSize, truncateHead } from "@earendil-works/pi-coding-agent";
 import { mkdtemp, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -15,31 +15,31 @@ function utf8Prefix(value: string, maxBytes: number): string {
 
 async function boundText(value: string): Promise<{
 	text: string;
-	truncated: boolean;
+	truncation?: TruncationResult;
 	fullOutputPath?: string;
 }> {
 	const full = truncateHead(value, { maxBytes: DEFAULT_MAX_BYTES, maxLines: DEFAULT_MAX_LINES });
-	if (!full.truncated) return { text: value, truncated: false };
+	if (!full.truncated) return { text: value };
 
-	let fullOutputPath: string | undefined;
-	try {
-		const directory = await mkdtemp(join(tmpdir(), "pi-tape-"));
-		fullOutputPath = join(directory, "output.txt");
-		await writeFile(fullOutputPath, value, "utf8");
-	} catch {
-		fullOutputPath = undefined;
-	}
+	const directory = await mkdtemp(join(tmpdir(), "pi-tape-"));
+	const fullOutputPath = join(directory, "output.txt");
+	await writeFile(fullOutputPath, value, "utf8");
 
-	const notice = fullOutputPath
-		? `\n\n[Output truncated: ${formatSize(full.totalBytes)}, ${full.totalLines} lines total.` +
-			` Full output: ${fullOutputPath}. This is a temporary file; copy or move it if it should persist.]`
-		: `\n\n[Output truncated: ${formatSize(full.totalBytes)}, ${full.totalLines} lines total.` +
-			" Full output could not be saved to a temporary file; rerun or narrow the request if safe.]";
+	const notice = `\n\n[Output truncated: ${formatSize(full.totalBytes)}, ${full.totalLines} lines total.` +
+		` Full output: ${fullOutputPath}. This is a temporary file; copy or move it if it should persist.]`;
 	const budget = DEFAULT_MAX_BYTES - Buffer.byteLength(notice);
-	const preview = truncateHead(value, { maxBytes: budget, maxLines: DEFAULT_MAX_LINES - 2 });
-	let content = preview.content;
-	if (!content && budget > 0) content = utf8Prefix(value.split("\n")[0] ?? "", budget);
-	return { text: content + notice, truncated: true, fullOutputPath };
+	let truncation = truncateHead(value, { maxBytes: budget, maxLines: DEFAULT_MAX_LINES - 2 });
+	if (truncation.firstLineExceedsLimit && budget > 0) {
+		const content = utf8Prefix(value.split("\n")[0] ?? "", budget);
+		truncation = {
+			...truncation,
+			content,
+			outputLines: content ? 1 : 0,
+			outputBytes: Buffer.byteLength(content),
+			lastLinePartial: Boolean(content),
+		};
+	}
+	return { text: truncation.content + notice, truncation, fullOutputPath };
 }
 
 async function boundResult<TDetails>(result: AgentToolResult<TDetails>): Promise<AgentToolResult<TDetails>> {
@@ -48,7 +48,7 @@ async function boundResult<TDetails>(result: AgentToolResult<TDetails>): Promise
 		.map((part) => part.text)
 		.join("\n");
 	const bounded = await boundText(text);
-	if (!bounded.truncated) return result;
+	if (!bounded.truncation) return result;
 
 	const nonText = result.content.filter((part) => part.type !== "text");
 	const details = result.details && typeof result.details === "object"
@@ -59,8 +59,8 @@ async function boundResult<TDetails>(result: AgentToolResult<TDetails>): Promise
 		content: [{ type: "text", text: bounded.text }, ...nonText],
 		details: {
 			...details,
-			truncated: true,
-			...(bounded.fullOutputPath ? { fullOutputPath: bounded.fullOutputPath } : {}),
+			truncation: bounded.truncation,
+			fullOutputPath: bounded.fullOutputPath,
 		} as TDetails,
 	};
 }

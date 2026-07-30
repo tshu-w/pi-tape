@@ -445,7 +445,7 @@ function scanTapeRecords(scope: "cwd" | "all", cwd: string, sessionDir: string |
 	const records: TapeRecord[] = [];
 
 	for (const item of listSessionFiles(sessionDir, sessionFile)) {
-		if (signal?.aborted) break;
+		if (signal?.aborted) throw new Error("Tape operation cancelled.");
 
 		if (isCurrentSessionFile(item.file, sessionFile)) {
 			records.push(...tapeRecordsFromEntries(sessionEntries, sessionFile, cwd));
@@ -465,7 +465,7 @@ function scanTapeRecords(scope: "cwd" | "all", cwd: string, sessionDir: string |
 		records.push(...cached.records);
 	}
 
-	if (!signal?.aborted && (dirty || Object.keys(next).length !== Object.keys(index).length)) {
+	if (dirty || Object.keys(next).length !== Object.keys(index).length) {
 		saveRecordIndex(next);
 	}
 	return records;
@@ -822,6 +822,12 @@ function renderRecordRow(r: TapeRecord, currentSessionFile: string | undefined, 
 	];
 }
 
+function continuationNotice(unit: "records" | "results", total: number, offset: number, shown: number): string {
+	const nextOffset = offset + shown;
+	const remaining = total - nextOffset;
+	return remaining > 0 ? `\n\n[${remaining} more ${unit}. Use offset=${nextOffset} to continue.]` : "";
+}
+
 function renderViewResults(records: Array<{ record: TapeRecord; onBranch: boolean }>, total: number, offset: number, currentSessionFile?: string): string {
 	if (records.length === 0) {
 		return total > 0 ? `No records at offset ${offset} (total ${total}).` : "No records in this session.";
@@ -841,7 +847,8 @@ function renderViewResults(records: Array<{ record: TapeRecord; onBranch: boolea
 		lines.push(...renderRecordRow(r, currentSessionFile, item.onBranch ? "" : "  "));
 	}
 
-	return `records (${records.length}/${total}, offset ${offset})\n${lines.join("\n")}`;
+	return `records (${records.length}/${total}, offset ${offset})\n${lines.join("\n")}` +
+		continuationNotice("records", total, offset, records.length);
 }
 
 function renderCrossSessionView(records: TapeRecord[], total: number, offset: number, scope: string, currentSessionFile?: string): string {
@@ -855,7 +862,8 @@ function renderCrossSessionView(records: TapeRecord[], total: number, offset: nu
 		lines.push(...renderRecordRow(r, currentSessionFile));
 	}
 
-	return `records (${records.length}/${total}, offset ${offset}, scope ${scope})\n${lines.join("\n")}`;
+	return `records (${records.length}/${total}, offset ${offset}, scope ${scope})\n${lines.join("\n")}` +
+		continuationNotice("records", total, offset, records.length);
 }
 
 function renderSearchResults(results: SearchResult[], total: number, offset: number, query: string, kinds: SearchKind[], timeFilterLabel: string, currentSessionFile?: string, showSessionLabel = false): string {
@@ -863,7 +871,11 @@ function renderSearchResults(results: SearchResult[], total: number, offset: num
 	const kindSuffix = isDefaultKinds ? "" : ` kinds=${kinds.join(",")}`;
 	const queryLabel = query ? `"${query}"` : "<all>";
 	const suffix = `${kindSuffix}${timeFilterLabel}`;
-	if (results.length === 0) return `No entries matching ${queryLabel}${suffix} (offset ${offset}).`;
+	if (results.length === 0) {
+		return total > 0
+			? `No entries at offset ${offset} (total ${total}).`
+			: `No entries matching ${queryLabel}${suffix} (offset ${offset}).`;
+	}
 	const lines = results.map((r) => {
 		const metadata = [
 			...(showSessionLabel ? [`session=${sessionLabel(r, currentSessionFile)}`, `sessionFile=${JSON.stringify(r.sessionFile ?? "")}`] : []),
@@ -871,7 +883,8 @@ function renderSearchResults(results: SearchResult[], total: number, offset: num
 		].join(" ");
 		return `- [${r.entryId.slice(0, 8)}] ${r.kind}/${r.role} ${metadata}\n  ${r.preview}`;
 	});
-	return `search ${queryLabel}${suffix} (${results.length}/${total}, offset ${offset})\n${lines.join("\n\n")}`;
+	return `search ${queryLabel}${suffix} (${results.length}/${total}, offset ${offset})\n${lines.join("\n\n")}` +
+		continuationNotice("results", total, offset, results.length);
 }
 
 function entryViewText(entry: any): string {
@@ -885,7 +898,8 @@ function entryViewText(entry: any): string {
 function renderEntryView(entry: any, offset: number, limit: number): string {
 	const text = entryViewText(entry);
 	const lines = text.split("\n");
-	const start = Math.min(offset, lines.length);
+	if (offset >= lines.length) throw new Error(`Offset ${offset} is beyond end of entry (${lines.length} lines total).`);
+	const start = offset;
 	const end = Math.min(lines.length, start + limit);
 	const body = lines.slice(start, end).join("\n");
 	const suffix = end < lines.length ? `\n\n[Showing lines ${start + 1}-${end} of ${lines.length}. Use offset=${end} to continue.]` : "";
@@ -933,13 +947,14 @@ export default function (pi: ExtensionAPI) {
 			scope: Type.Optional(StringEnum(["branch", "session", "cwd", "all"] as const, {
 				description: "Scope. Default: session for search, cwd for view.",
 			})),
-			limit: Type.Optional(Type.Number({ description: "Max results/lines. Default: 20 for view records, 200 for entry view, 10 for search." })),
-			offset: Type.Optional(Type.Number({ description: "Skip N records/lines. Default: 0." })),
+			limit: Type.Optional(Type.Number({ description: "Maximum items to return (lines when viewing an entry). Defaults: 20 records, 200 entry lines, 10 search results." })),
+			offset: Type.Optional(Type.Number({ description: "Number of items to skip (lines when viewing an entry). Default: 0." })),
 		}),
 		renderCall(args, theme, context) {
 			return renderToolCall("tape", args, theme, !context.isPartial);
 		},
 		async execute(_id, params, signal, _onUpdate, ctx) {
+			if (signal?.aborted) throw new Error("Tape operation cancelled.");
 			const branchEntries = ctx.sessionManager.getBranch() as any[];
 			const sessionEntries = ctx.sessionManager.getEntries() as any[];
 			const sessionDir = ctx.sessionManager.getSessionDir();
@@ -984,15 +999,15 @@ export default function (pi: ExtensionAPI) {
 				// ── anchor ──────────────────────────────────────
 				case "anchor": {
 					if (!params.name || !params.summary) {
-						return { content: [{ type: "text", text: "`name` and `summary` are required for anchor." }], details: {} };
+						throw new Error("`name` and `summary` are required for anchor.");
 					}
 					if (params.name.startsWith("compact/")) {
-						return { content: [{ type: "text", text: "Anchor names starting with `compact/` are reserved for compact records." }], details: {} };
+						throw new Error("Anchor names starting with `compact/` are reserved for compact records.");
 					}
 					const currentBranchAnchors = anchorRecordsFromEntries(branchEntries, sessionFile, ctx.cwd);
 					const existing = currentBranchAnchors.find((a) => a.name === params.name);
 					if (existing) {
-						return { content: [{ type: "text", text: `Anchor "${params.name}" already exists on this branch at [${existing.entryId.slice(0, 8)}]. Choose a new name.` }], details: {} };
+						throw new Error(`Anchor "${params.name}" already exists on this branch at [${existing.entryId.slice(0, 8)}]. Choose a new name.`);
 					}
 
 					const keepRecentTokens = DEFAULT_KEEP_RECENT_TOKENS;
@@ -1026,7 +1041,7 @@ export default function (pi: ExtensionAPI) {
 				// ── view ────────────────────────────────────────
 				case "view": {
 					const scope = params.scope ?? "cwd";
-					const limit = Math.max(0, Math.trunc(params.limit ?? (params.entryId ? 200 : 20)));
+					const limit = Math.max(1, Math.trunc(params.limit ?? (params.entryId ? 200 : 20)));
 					const offset = Math.max(0, Math.trunc(params.offset ?? 0));
 
 					if (params.entryId) {
@@ -1047,7 +1062,7 @@ export default function (pi: ExtensionAPI) {
 							addMatches(sessionEntries, sessionFile, ctx.cwd);
 						} else {
 							for (const item of listSessionFiles(sessionDir, sessionFile)) {
-								if (signal?.aborted) break;
+								if (signal?.aborted) throw new Error("Tape operation cancelled.");
 								const parsed = sessionEntriesForScan(item, sessionFile, sessionEntries, ctx.cwd);
 								if (!parsed) continue;
 								if (scope === "cwd" && parsed.cwd !== ctx.cwd) continue;
@@ -1056,16 +1071,16 @@ export default function (pi: ExtensionAPI) {
 						}
 
 						if (candidates.length === 0) {
-							return { content: [{ type: "text", text: `No entry matching ${entryId}.` }], details: { entryId } };
+							throw new Error(`No entry matching ${entryId}.`);
 						}
 						if (candidates.length > 1) {
 							const lines = candidates.slice(0, 10).map((c) => `- [${c.entry.id.slice(0, 8)}] session=${sessionLabel({ sessionFile: c.file }, sessionFile)} time=${formatTimestampSecond(normalizeTimestamp(c.entry.timestamp))}`);
-							return { content: [{ type: "text", text: `Entry prefix ${entryId} is ambiguous (${candidates.length} matches):\n${lines.join("\n")}` }], details: { entryId, matches: candidates.length } };
+							throw new Error(`Entry prefix ${entryId} is ambiguous (${candidates.length} matches):\n${lines.join("\n")}`);
 						}
 
 						const found = candidates[0];
 						return {
-							content: [{ type: "text", text: renderEntryView(found.entry, offset, Math.max(1, limit)) }],
+							content: [{ type: "text", text: renderEntryView(found.entry, offset, limit) }],
 							details: { entryId: found.entry.id, sessionFile: found.file, sessionCwd: found.cwd, offset, limit },
 						};
 					}
@@ -1114,11 +1129,11 @@ export default function (pi: ExtensionAPI) {
 				case "search": {
 					const query = params.query ?? "";
 					const start = parseFilterTimestamp(params.start, "start");
-					if (start.error) return { content: [{ type: "text", text: start.error }], details: {} };
+					if (start.error) throw new Error(start.error);
 					const end = parseFilterTimestamp(params.end, "end");
-					if (end.error) return { content: [{ type: "text", text: end.error }], details: {} };
+					if (end.error) throw new Error(end.error);
 					if (!query.trim() && start.value == null && end.value == null) {
-						return { content: [{ type: "text", text: "`query`, `start`, or `end` is required for search." }], details: {} };
+						throw new Error("`query`, `start`, or `end` is required for search.");
 					}
 
 					const scope = params.scope ?? "session";
@@ -1126,7 +1141,7 @@ export default function (pi: ExtensionAPI) {
 					const queryExpr = parseQuery(query);
 					const timeFilter = { start: start.value, end: end.value };
 					const timeFilterLabel = `${params.start ? ` start=${params.start}` : ""}${params.end ? ` end=${params.end}` : ""}`;
-					const limit = Math.max(0, Math.trunc(params.limit ?? 10));
+					const limit = Math.max(1, Math.trunc(params.limit ?? 10));
 					const offset = Math.max(0, Math.trunc(params.offset ?? 0));
 
 					let allMatches: SearchResult[];
@@ -1138,7 +1153,7 @@ export default function (pi: ExtensionAPI) {
 					} else {
 						allMatches = [];
 						for (const item of listSessionFiles(sessionDir, sessionFile)) {
-							if (signal?.aborted) break;
+							if (signal?.aborted) throw new Error("Tape operation cancelled.");
 							const parsed = sessionEntriesForScan(item, sessionFile, sessionEntries, ctx.cwd);
 							if (!parsed) continue;
 							if (scope === "cwd" && parsed.cwd !== ctx.cwd) continue;
@@ -1154,12 +1169,25 @@ export default function (pi: ExtensionAPI) {
 
 					return {
 						content: [{ type: "text", text: renderSearchResults(page, total, offset, query, kinds, timeFilterLabel, sessionFile, scope === "cwd" || scope === "all") }],
-						details: { results: page, total, offset, limit },
+						details: {
+							results: page.map((result) => ({
+								entryId: result.entryId,
+								timestamp: result.timestamp,
+								kind: result.kind,
+								role: result.role,
+								sessionFile: result.sessionFile,
+								sessionCwd: result.sessionCwd,
+								sourceSessionFile: result.sourceSessionFile,
+							})),
+							total,
+							offset,
+							limit,
+						},
 					};
 				}
 
 				default:
-					return { content: [{ type: "text", text: `Unknown action: ${params.action}` }], details: {} };
+					throw new Error(`Unknown action: ${params.action}`);
 			}
 		},
 	}));
