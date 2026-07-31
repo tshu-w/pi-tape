@@ -76,7 +76,7 @@ test("cross-session search body returns a complete sessionFile usable by view fo
 	const result = search.details.results[0];
 	assert.equal(result.sessionFile, externalSessionFile, "the live current copy is the stable preferred result");
 	assert.ok(path.isAbsolute(result.sessionFile));
-	assert.ok(search.content[0].text.includes(`sessionFile=${JSON.stringify(result.sessionFile)}`));
+	assert.ok(search.content[0].text.includes(`sessionFile: ${JSON.stringify(result.sessionFile)}`));
 
 	const view = await tools.tape.execute("v2", { action: "view", entryId: duplicated.id, sessionFile: result.sessionFile }, undefined, undefined, ctx);
 	assert.match(view.content[0].text, /fork duplicated marker/);

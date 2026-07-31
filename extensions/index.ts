@@ -827,8 +827,11 @@ function sessionLabel(record: { sessionFile?: string }, currentSessionFile?: str
 
 function renderRecordRow(r: TapeRecord, currentSessionFile: string | undefined, indent = ""): string[] {
 	return [
-		`${indent}${r.name} [${r.entryId.slice(0, 8)}] ${formatTimestampSecond(r.timestamp)} — ${sessionLabel(r, currentSessionFile)}`,
-		`${indent}  ${firstSummaryLine(r.summary)}`,
+		`${indent}- name: ${JSON.stringify(r.name)}`,
+		`${indent}  entryId: ${JSON.stringify(r.entryId.slice(0, 8))}`,
+		`${indent}  time: ${JSON.stringify(formatTimestampSecond(r.timestamp))}`,
+		`${indent}  session: ${JSON.stringify(sessionLabel(r, currentSessionFile))}`,
+		`${indent}  summary: ${JSON.stringify(firstSummaryLine(r.summary))}`,
 	];
 }
 
@@ -857,7 +860,7 @@ function renderViewResults(records: Array<{ record: TapeRecord; onBranch: boolea
 		lines.push(...renderRecordRow(r, currentSessionFile, item.onBranch ? "" : "  "));
 	}
 
-	return `records (${records.length}/${total})\n${lines.join("\n")}` +
+	return `records (${records.length}/${total})\n\n${lines.join("\n")}` +
 		continuationNotice("records", total, offset, records.length);
 }
 
@@ -872,7 +875,7 @@ function renderCrossSessionView(records: TapeRecord[], total: number, offset: nu
 		lines.push(...renderRecordRow(r, currentSessionFile));
 	}
 
-	return `records (${records.length}/${total})\n${lines.join("\n")}` +
+	return `records (${records.length}/${total})\n\n${lines.join("\n")}` +
 		continuationNotice("records", total, offset, records.length);
 }
 
@@ -880,17 +883,19 @@ function renderSearchResults(results: SearchResult[], total: number, offset: num
 	if (results.length === 0) {
 		return total > 0 ? `No entries at offset ${offset} (total ${total}).` : "No entries found.";
 	}
-	const lines = results.map((result) => {
-		const metadata = [
-			`kind=${result.kind}`,
-			...(result.role !== result.kind ? [`role=${result.role}`] : []),
-			...(result.toolName ? [`tool=${result.toolName}`] : []),
-			`time=${formatTimestampSecond(result.timestamp)}`,
-			...(showSessionFile ? [`sessionFile=${JSON.stringify(result.sessionFile ?? "")}`] : []),
-		].join(" ");
-		return `- [${result.entryId.slice(0, 8)}] ${metadata}\n  ${result.preview}`;
+	const records = results.map((result) => {
+		const lines = [
+			`- entryId: ${JSON.stringify(result.entryId.slice(0, 8))}`,
+			`  kind: ${JSON.stringify(result.kind)}`,
+		];
+		if (result.role !== result.kind) lines.push(`  role: ${JSON.stringify(result.role)}`);
+		if (result.toolName) lines.push(`  tool: ${JSON.stringify(result.toolName)}`);
+		lines.push(`  time: ${JSON.stringify(formatTimestampSecond(result.timestamp))}`);
+		if (showSessionFile) lines.push(`  sessionFile: ${JSON.stringify(result.sessionFile ?? "")}`);
+		lines.push(`  preview: ${JSON.stringify(result.preview)}`);
+		return lines.join("\n");
 	});
-	return `search results (${results.length}/${total})\n${lines.join("\n\n")}` +
+	return `search results (${results.length}/${total})\n\n${records.join("\n\n")}` +
 		continuationNotice("results", total, offset, results.length);
 }
 

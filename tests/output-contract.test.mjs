@@ -38,8 +38,8 @@ test("search details retain location metadata without copying matched payloads",
 	assert.equal(result.details.results[0].entryId, entry.id);
 	assert.equal(result.details.results[0].role, "toolResult");
 	assert.equal(result.details.results[0].toolName, "bash");
-	assert.match(result.content[0].text, /kind=tool_result role=toolResult tool=bash/);
-	assert.match(result.content[0].text, /…$/);
+	assert.match(result.content[0].text, /kind: "tool_result"\n  role: "toolResult"\n  tool: "bash"/);
+	assert.match(result.content[0].text, /…"$/);
 });
 
 test("all actions share the final byte and line contract", async () => {
@@ -253,7 +253,7 @@ test("search and record listings provide read-style offset continuation", async 
 
 	const searchCtx = makeCtx({ cwd: "/work", branch: entries });
 	const firstSearch = await tools.tape.execute("search-1", { action: "search", query: "needle", scope: "branch", limit: 1 }, undefined, undefined, searchCtx);
-	assert.match(firstSearch.content[0].text, /^search results \(1\/3\)\n- \[entry-2\] kind=message role=user time=/);
+	assert.match(firstSearch.content[0].text, /^search results \(1\/3\)\n\n- entryId: "entry-2"\n  kind: "message"\n  role: "user"\n  time: /);
 	assert.match(firstSearch.content[0].text, /\[2 more results\. Use offset=1 to continue\.\]/);
 	const lastSearch = await tools.tape.execute("search-2", { action: "search", query: "needle", scope: "branch", limit: 1, offset: 2 }, undefined, undefined, searchCtx);
 	assert.doesNotMatch(lastSearch.content[0].text, /more results/);
@@ -267,7 +267,7 @@ test("search and record listings provide read-style offset continuation", async 
 	const viewCtx = makeCtx({ cwd: "/work", branch: anchors });
 	const firstView = await tools.tape.execute("view-1", { action: "view", scope: "branch", limit: 1 }, undefined, undefined, viewCtx);
 	assert.match(firstView.content[0].text, /^records \(1\/3\)/);
-	assert.match(firstView.content[0].text, /— \(current\)/);
+	assert.match(firstView.content[0].text, /session: "\(current\)"/);
 	assert.match(firstView.content[0].text, /summary 2…/);
 	assert.match(firstView.content[0].text, /\[2 more records\. Use offset=1 to continue\.\]/);
 	assert.deepEqual(Object.keys(firstView.details).sort(), ["limit", "offset", "scope", "shown", "total"]);
