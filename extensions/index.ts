@@ -885,13 +885,13 @@ function renderSearchResults(results: SearchResult[], total: number, offset: num
 	}
 	const records = results.map((result) => {
 		const lines = [
-			`- entryId: ${JSON.stringify(result.entryId.slice(0, 8))}`,
-			`  kind: ${JSON.stringify(result.kind)}`,
+			`- entryId: ${result.entryId.slice(0, 8)}`,
+			`  kind: ${result.kind}`,
 		];
-		if (result.role !== result.kind) lines.push(`  role: ${JSON.stringify(result.role)}`);
-		if (result.toolName) lines.push(`  tool: ${JSON.stringify(result.toolName)}`);
-		lines.push(`  time: ${JSON.stringify(formatTimestampSecond(result.timestamp))}`);
-		if (showSessionFile) lines.push(`  sessionFile: ${JSON.stringify(result.sessionFile ?? "")}`);
+		if (result.role !== result.kind) lines.push(`  role: ${result.role}`);
+		if (result.toolName) lines.push(`  tool: ${result.toolName}`);
+		lines.push(`  time: ${formatTimestampSecond(result.timestamp)}`);
+		if (showSessionFile) lines.push(`  sessionFile: ${result.sessionFile ?? ""}`);
 		lines.push(`  preview: ${JSON.stringify(result.preview)}`);
 		return lines.join("\n");
 	});
