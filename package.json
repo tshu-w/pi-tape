@@ -13,13 +13,18 @@
 		"extensions": ["./extensions"]
 	},
 	"peerDependencies": {
-		"@earendil-works/pi-coding-agent": ">=0.81.1",
+		"@earendil-works/pi-coding-agent": "*",
 		"@earendil-works/pi-agent-core": "*",
 		"@earendil-works/pi-ai": "*",
 		"@earendil-works/pi-tui": "*",
 		"typebox": "*"
 	},
 	"devDependencies": {
-		"jiti": "^2.7.0"
+		"@earendil-works/pi-coding-agent": "0.82.1",
+		"@earendil-works/pi-agent-core": "0.82.1",
+		"@earendil-works/pi-ai": "0.82.1",
+		"@earendil-works/pi-tui": "0.82.1",
+		"jiti": "^2.7.0",
+		"typebox": "1.1.38"
 	}
 }

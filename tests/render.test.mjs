@@ -22,17 +22,30 @@ test("tool call renders every argument in function-call form", () => {
 	assert.equal(styles.some(([color]) => color === "accent"), false);
 });
 
-test("anchor summary is truncated to a prefix in the call line", () => {
+test("anchor summary is shortened only when a successful result repeats it", () => {
 	const theme = { bold: (text) => text, fg: (_color, text) => text };
 	const summary = "H".repeat(150) + "T".repeat(150);
-	const component = tools.tape.renderCall({ action: "anchor", name: "n1", summary }, theme, { expanded: false });
-	const line = component.render(10000)[0];
+	const args = { action: "anchor", name: "n1", summary };
+	const pending = tools.tape.renderCall(args, theme, { expanded: false, isPartial: true, isError: false });
+	assert.ok(pending.render(10000)[0].includes("T".repeat(150)));
+
+	const failed = tools.tape.renderCall(args, theme, { expanded: false, isPartial: false, isError: true });
+	assert.ok(failed.render(10000)[0].includes("T".repeat(150)));
+
+	const completed = tools.tape.renderCall(args, theme, {
+		expanded: false,
+		isPartial: false,
+		isError: false,
+		lastComponent: failed,
+	});
+	assert.equal(completed, failed);
+	const line = completed.render(10000)[0];
 	assert.ok(line.includes('action="anchor"'));
 	assert.ok(line.includes("H".repeat(80) + "…"));
 	assert.equal(line.includes("H".repeat(81)), false);
 	assert.equal(line.includes("T"), false);
 	assert.ok(line.trimEnd().endsWith(')'));
 
-	const short = tools.tape.renderCall({ action: "anchor", summary: "brief" }, theme, { expanded: false });
+	const short = tools.tape.renderCall({ action: "anchor", summary: "brief" }, theme, { expanded: false, isPartial: false, isError: false });
 	assert.ok(short.render(10000)[0].includes('summary="brief"'));
 });

@@ -5,14 +5,6 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { TSchema } from "typebox";
 
-function utf8Prefix(value: string, maxBytes: number): string {
-	const buffer = Buffer.from(value, "utf8");
-	if (buffer.length <= maxBytes) return value;
-	let end = maxBytes;
-	while (end > 0 && (buffer[end] & 0b1100_0000) === 0b1000_0000) end--;
-	return buffer.subarray(0, end).toString("utf8");
-}
-
 async function boundText(value: string): Promise<{
 	text: string;
 	truncation?: TruncationResult;
@@ -25,21 +17,16 @@ async function boundText(value: string): Promise<{
 	const fullOutputPath = join(directory, "output.txt");
 	await writeFile(fullOutputPath, value, "utf8");
 
-	const notice = `\n\n[Output truncated: ${formatSize(full.totalBytes)}, ${full.totalLines} lines total.` +
-		` Full output: ${fullOutputPath}. This is a temporary file; copy or move it if it should persist.]`;
-	const budget = DEFAULT_MAX_BYTES - Buffer.byteLength(notice);
-	let truncation = truncateHead(value, { maxBytes: budget, maxLines: DEFAULT_MAX_LINES - 2 });
-	if (truncation.firstLineExceedsLimit && budget > 0) {
-		const content = utf8Prefix(value.split("\n")[0] ?? "", budget);
-		truncation = {
-			...truncation,
-			content,
-			outputLines: content ? 1 : 0,
-			outputBytes: Buffer.byteLength(content),
-			lastLinePartial: Boolean(content),
-		};
-	}
-	return { text: truncation.content + notice, truncation, fullOutputPath };
+	const notice = `[Output truncated: ${full.totalLines} lines, ${formatSize(full.totalBytes)} total.` +
+		` Full output: ${fullOutputPath}]`;
+	const suffix = `\n\n${notice}`;
+	const budget = DEFAULT_MAX_BYTES - Buffer.byteLength(suffix);
+	const truncation = truncateHead(value, { maxBytes: budget, maxLines: DEFAULT_MAX_LINES - 2 });
+	return {
+		text: truncation.content ? truncation.content + suffix : notice,
+		truncation,
+		fullOutputPath,
+	};
 }
 
 async function boundResult<TDetails>(result: AgentToolResult<TDetails>): Promise<AgentToolResult<TDetails>> {
@@ -72,13 +59,7 @@ export function withToolOutputContract<TParams extends TSchema, TDetails, TState
 	return {
 		...definition,
 		async execute(id, params, signal, onUpdate, ctx) {
-			try {
-				return await boundResult(await execute(id, params, signal, onUpdate, ctx));
-			} catch (error) {
-				const message = error instanceof Error ? error.message : String(error);
-				const bounded = await boundText(message);
-				throw new Error(bounded.text, { cause: error });
-			}
+			return boundResult(await execute(id, params, signal, onUpdate, ctx));
 		},
 	};
 }

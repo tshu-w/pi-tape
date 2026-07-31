@@ -53,7 +53,7 @@ export function anchorMessage({ name, summary, cwd, createdAt, keepRecentTokens 
 	return {
 		role: "toolResult",
 		toolName: "tape",
-		content: [{ type: "text", text: `[Anchor: ${name}]\n${summary}` }],
+		content: [{ type: "text", text: `Anchor created: ${name}\n${summary}` }],
 		timestamp: Date.parse(createdAt),
 		details: { tapeAnchor: { version: 1, name, summary, keepRecentTokens, createdAt, source: { cwd } } },
 	};

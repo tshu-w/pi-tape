@@ -83,4 +83,23 @@ test("cross-session search body returns a complete sessionFile usable by view fo
 	assert.equal(view.details.sessionFile, externalSessionFile);
 });
 
+test("view rejects session-shaped JSONL outside managed session locations", async () => {
+	const untrustedFile = path.join(agentDir, "outside", "untrusted.jsonl");
+	fs.mkdirSync(path.dirname(untrustedFile), { recursive: true });
+	fs.writeFileSync(untrustedFile, [
+		JSON.stringify({ type: "session", cwd }),
+		JSON.stringify({
+			type: "message",
+			id: "untrusted-entry-id",
+			timestamp: "2026-08-01T10:04:00.000Z",
+			message: textMessage("user", "untrusted marker"),
+		}),
+	].join("\n"));
+
+	await assert.rejects(
+		tools.tape.execute("v3", { action: "view", entryId: "untrusted-entry-id", sessionFile: untrustedFile }, undefined, undefined, ctx),
+		/configured session directories/,
+	);
+});
+
 test.after(() => fs.rmSync(agentDir, { recursive: true, force: true }));

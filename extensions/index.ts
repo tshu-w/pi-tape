@@ -49,6 +49,8 @@ import { withToolOutputContract } from "./tool-output.js";
 // ============================================================================
 
 const DEFAULT_KEEP_RECENT_TOKENS = 20000;
+const ANCHOR_NAME_MAX_LENGTH = 80;
+const ANCHOR_NAME_PATTERN = /^[a-z0-9]+(?:-[a-z0-9]+)*(?:\/[a-z0-9]+(?:-[a-z0-9]+)*)*$/;
 const NOTES_BUDGET_LINES = 150;
 const NOTES_MAX_LINES = 400;
 const NOTES_MAX_BYTES = 16 * 1024;
@@ -56,7 +58,6 @@ const RECENT_ANCHORS_LIMIT = 10;
 const SEARCH_PREVIEW_LENGTH = 200;
 const DEFAULT_SEARCH_KINDS = ["message", "tool_result"] as const;
 const SEARCH_KINDS = ["message", "tool_result", "tool_call", "anchor", "compact", "summary", "custom"] as const;
-const DEFAULT_SEARCH_KINDS_SET = new Set<string>(DEFAULT_SEARCH_KINDS);
 const SEARCH_INTERNAL_TOOL_NAMES = new Set(["tape"]);
 
 // ============================================================================
@@ -68,12 +69,10 @@ interface TapeAnchorData {
 	name: string;
 	summary: string;
 	keepRecentTokens: number;
-	firstKeptEntryId?: string;
 	createdAt: string;
 	source: {
 		cwd: string;
 		sessionFile?: string;
-		leafId?: string;
 	};
 }
 
@@ -102,6 +101,7 @@ interface TimeFilter {
 interface SearchItem {
 	kind: SearchKind;
 	role: string;
+	toolName?: string;
 	searchableText: string;
 	timestamp: string;
 	sessionFile?: string;
@@ -114,6 +114,7 @@ interface SearchResult {
 	timestamp: string;
 	kind: SearchKind;
 	role: string;
+	toolName?: string;
 	preview: string;
 	sessionFile?: string;
 	sessionCwd?: string;
@@ -192,6 +193,17 @@ function isCurrentSessionFile(file: string, sessionFile?: string): boolean {
 	return !!sessionFile && resolvedFilePath(file) === resolvedFilePath(sessionFile);
 }
 
+function isManagedSessionFile(file: string, sessionDir?: string, sessionFile?: string): boolean {
+	if (isCurrentSessionFile(file, sessionFile)) return true;
+	if (path.extname(file) !== ".jsonl") return false;
+	const resolvedFile = resolvedFilePath(file);
+	return [getSessionsDir(), sessionDir].some((dir) => {
+		if (!dir) return false;
+		const relative = path.relative(resolvedFilePath(dir), resolvedFile);
+		return relative !== "" && relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative);
+	});
+}
+
 function sessionEntriesForScan(item: { file: string }, sessionFile: string | undefined, sessionEntries: any[], cwd: string): { file: string; cwd?: string; entries: any[] } | null {
 	if (isCurrentSessionFile(item.file, sessionFile)) return { file: sessionFile!, cwd, entries: sessionEntries };
 	const parsed = parseSessionFile(item.file);
@@ -211,6 +223,7 @@ interface NotesFile {
 }
 
 function cwdSlug(cwd: string): string {
+	// TODO: Use collision-resistant paths when project-notes storage is redesigned.
 	return `--${cwd.replace(/^[/\\]/, "").replace(/[/\\:]/g, "-")}--`;
 }
 
@@ -307,7 +320,7 @@ function parseFilterTimestamp(value: unknown, name: string): { value?: number; e
 		? `${raw}T${name === "end" ? "23:59:59.999" : "00:00:00.000"}`
 		: raw;
 	const parsed = Date.parse(timestamp);
-	if (Number.isNaN(parsed)) return { error: `\`${name}\` is not a valid timestamp: ${value}` };
+	if (Number.isNaN(parsed)) return { error: `\`${name}\` is not a valid timestamp. Use an ISO timestamp or YYYY-MM-DD.` };
 	return { value: parsed };
 }
 
@@ -519,8 +532,15 @@ function extractSearchItems(entry: any, sessionFile?: string, sessionCwd?: strin
 			} else if (Array.isArray(msg.content)) {
 				content = stringifyContentBlocks(msg.content);
 			}
-			const role = msg.toolName ? `toolResult:${msg.toolName}` : "toolResult";
-			return content ? [{ kind: "tool_result", role, searchableText: content, timestamp, sessionFile, sessionCwd }] : [];
+			return content ? [{
+				kind: "tool_result",
+				role: "toolResult",
+				toolName: msg.toolName,
+				searchableText: content,
+				timestamp,
+				sessionFile,
+				sessionCwd,
+			}] : [];
 		}
 
 		if (msg.role === "assistant") {
@@ -582,11 +602,13 @@ function matchingQueryTerm(content: string, query: QueryExpr): string | undefine
 
 function makePreview(content: string, term: string | undefined): string {
 	const matchIdx = term ? content.toLowerCase().indexOf(term) : 0;
-	const start = Math.max(0, matchIdx - 50);
-	const end = Math.min(content.length, start + SEARCH_PREVIEW_LENGTH);
+	let start = Math.max(0, matchIdx - 50);
+	if (start > 0 && /[\uDC00-\uDFFF]/.test(content[start] ?? "")) start--;
+	let end = Math.min(content.length, start + SEARCH_PREVIEW_LENGTH);
+	if (end < content.length && /[\uD800-\uDBFF]/.test(content[end - 1] ?? "")) end++;
 	let preview = content.slice(start, end).replace(/\n/g, " ");
-	if (start > 0) preview = "..." + preview;
-	if (end < content.length) preview += "...";
+	if (start > 0) preview = "…" + preview;
+	if (end < content.length) preview += "…";
 	return preview;
 }
 
@@ -607,6 +629,7 @@ function matchEntries(entries: any[], query: QueryExpr, kinds: SearchKind[], tim
 				timestamp: item.timestamp,
 				kind: item.kind,
 				role: item.role,
+				toolName: item.toolName,
 				preview: makePreview(item.searchableText, term),
 				sessionFile: item.sessionFile,
 				sessionCwd: item.sessionCwd,
@@ -629,22 +652,6 @@ function dedupeRecords<T extends { kind: string; entryId: string; timestamp?: st
 		seen.add(key);
 		return true;
 	});
-}
-
-// ============================================================================
-// firstKeptEntryId calculation
-// ============================================================================
-
-function calculateFirstKeptEntryId(branchEntries: any[], keepRecentTokens: number): string | undefined {
-	const cutPoint = findCutPoint(branchEntries, 0, branchEntries.length, keepRecentTokens);
-	const keepFromIdx = cutPoint.isSplitTurn && cutPoint.turnStartIndex >= 0
-		? cutPoint.turnStartIndex
-		: cutPoint.firstKeptEntryIndex;
-	for (let i = keepFromIdx; i < branchEntries.length; i++) {
-		const entry = branchEntries[i];
-		if (entry?.type === "message") return entry.id;
-	}
-	return undefined;
 }
 
 function entriesFromMessages(messages: any[]): any[] {
@@ -805,13 +812,16 @@ function firstSummaryLine(summary: string): string {
 			.replace(/^[-*+]\s+/, "")
 			.replace(/^\d+\.\s+/, "")
 			.trim();
-		return `${section ? `${section}: ` : ""}${text}`.slice(0, 100);
+		const preview = `${section ? `${section}: ` : ""}${text}`;
+		return `${Array.from(preview).slice(0, 99).join("")}…`;
 	}
-	return fallback.slice(0, 100);
+	return fallback ? `${Array.from(fallback).slice(0, 99).join("")}…` : "";
 }
 
 function sessionLabel(record: { sessionFile?: string }, currentSessionFile?: string): string {
-	if (currentSessionFile && record.sessionFile === currentSessionFile) return "(current)";
+	if ((!currentSessionFile && !record.sessionFile) || (currentSessionFile && record.sessionFile === currentSessionFile)) {
+		return "(current)";
+	}
 	return path.basename(record.sessionFile ?? "unknown").replace(".jsonl", "");
 }
 
@@ -830,7 +840,7 @@ function continuationNotice(unit: "records" | "results", total: number, offset: 
 
 function renderViewResults(records: Array<{ record: TapeRecord; onBranch: boolean }>, total: number, offset: number, currentSessionFile?: string): string {
 	if (records.length === 0) {
-		return total > 0 ? `No records at offset ${offset} (total ${total}).` : "No records in this session.";
+		return total > 0 ? `No records at offset ${offset} (total ${total}).` : "No records found.";
 	}
 
 	const lines: string[] = [];
@@ -847,13 +857,13 @@ function renderViewResults(records: Array<{ record: TapeRecord; onBranch: boolea
 		lines.push(...renderRecordRow(r, currentSessionFile, item.onBranch ? "" : "  "));
 	}
 
-	return `records (${records.length}/${total}, offset ${offset})\n${lines.join("\n")}` +
+	return `records (${records.length}/${total})\n${lines.join("\n")}` +
 		continuationNotice("records", total, offset, records.length);
 }
 
-function renderCrossSessionView(records: TapeRecord[], total: number, offset: number, scope: string, currentSessionFile?: string): string {
+function renderCrossSessionView(records: TapeRecord[], total: number, offset: number, currentSessionFile?: string): string {
 	if (records.length === 0) {
-		return total > 0 ? `No records at offset ${offset} (total ${total}, scope ${scope}).` : `No records found (scope: ${scope}).`;
+		return total > 0 ? `No records at offset ${offset} (total ${total}).` : "No records found.";
 	}
 
 	const lines: string[] = [];
@@ -862,48 +872,84 @@ function renderCrossSessionView(records: TapeRecord[], total: number, offset: nu
 		lines.push(...renderRecordRow(r, currentSessionFile));
 	}
 
-	return `records (${records.length}/${total}, offset ${offset}, scope ${scope})\n${lines.join("\n")}` +
+	return `records (${records.length}/${total})\n${lines.join("\n")}` +
 		continuationNotice("records", total, offset, records.length);
 }
 
-function renderSearchResults(results: SearchResult[], total: number, offset: number, query: string, kinds: SearchKind[], timeFilterLabel: string, currentSessionFile?: string, showSessionLabel = false): string {
-	const isDefaultKinds = kinds.length === DEFAULT_SEARCH_KINDS_SET.size && kinds.every((k) => DEFAULT_SEARCH_KINDS_SET.has(k));
-	const kindSuffix = isDefaultKinds ? "" : ` kinds=${kinds.join(",")}`;
-	const queryLabel = query ? `"${query}"` : "<all>";
-	const suffix = `${kindSuffix}${timeFilterLabel}`;
+function renderSearchResults(results: SearchResult[], total: number, offset: number, currentSessionFile?: string, showSessionFile = false): string {
 	if (results.length === 0) {
-		return total > 0
-			? `No entries at offset ${offset} (total ${total}).`
-			: `No entries matching ${queryLabel}${suffix} (offset ${offset}).`;
+		return total > 0 ? `No entries at offset ${offset} (total ${total}).` : "No entries found.";
 	}
-	const lines = results.map((r) => {
+	const lines = results.map((result) => {
 		const metadata = [
-			...(showSessionLabel ? [`session=${sessionLabel(r, currentSessionFile)}`, `sessionFile=${JSON.stringify(r.sessionFile ?? "")}`] : []),
-			`time=${formatTimestampSecond(r.timestamp)}`,
+			`kind=${result.kind}`,
+			...(result.role !== result.kind ? [`role=${result.role}`] : []),
+			...(result.toolName ? [`tool=${result.toolName}`] : []),
+			`time=${formatTimestampSecond(result.timestamp)}`,
+			...(showSessionFile ? [`sessionFile=${JSON.stringify(result.sessionFile ?? "")}`] : []),
 		].join(" ");
-		return `- [${r.entryId.slice(0, 8)}] ${r.kind}/${r.role} ${metadata}\n  ${r.preview}`;
+		return `- [${result.entryId.slice(0, 8)}] ${metadata}\n  ${result.preview}`;
 	});
-	return `search ${queryLabel}${suffix} (${results.length}/${total}, offset ${offset})\n${lines.join("\n\n")}` +
+	return `search results (${results.length}/${total})\n${lines.join("\n\n")}` +
 		continuationNotice("results", total, offset, results.length);
 }
 
-function entryViewText(entry: any): string {
-	const items = extractSearchItems(entry);
-	if (items.length > 0) {
-		return items.map((item) => `## ${item.kind}/${item.role}\n${item.searchableText}`).join("\n\n");
-	}
-	return JSON.stringify(entry, null, 2);
+function messageViewText(message: any): string {
+	if (typeof message?.content === "string") return message.content;
+	if (!Array.isArray(message?.content)) return message?.summary ?? "";
+	return message.content
+		.map((block: any) => {
+			if (typeof block === "string") return block;
+			if (block?.type === "text") return block.text ?? "";
+			if (block?.type === "thinking") return block.thinking ?? "";
+			if (block?.type === "toolCall") {
+				return `toolCall name=${block.name} arguments=${JSON.stringify(block.arguments ?? {})}`;
+			}
+			if (block?.type === "image") return `image mimeType=${block.mimeType ?? "unknown"}`;
+			return "";
+		})
+		.filter(Boolean)
+		.join("\n\n");
 }
 
-function renderEntryView(entry: any, offset: number, limit: number): string {
-	const text = entryViewText(entry);
-	const lines = text.split("\n");
-	if (offset >= lines.length) throw new Error(`Offset ${offset} is beyond end of entry (${lines.length} lines total).`);
-	const start = offset;
-	const end = Math.min(lines.length, start + limit);
+function entryViewContent(entry: any): { attributes: string[]; text: string } {
+	const anchor = anchorFromEntry(entry);
+	if (anchor) return { attributes: ["type=anchor", `name=${anchor.name}`], text: anchor.summary };
+
+	const compactRecord = compactFromEntry(entry);
+	if (compactRecord) {
+		return { attributes: ["type=compaction", `name=${compactRecord.name}`], text: compactRecord.summary };
+	}
+
+	if (entry?.type === "message" && entry.message) {
+		const message = entry.message;
+		const attributes = ["type=message", `role=${message.role ?? "unknown"}`];
+		if (message.toolName) attributes.push(`tool=${message.toolName}`);
+		return { attributes, text: messageViewText(message) || JSON.stringify(entry, null, 2) };
+	}
+	if (entry?.type === "branch_summary") {
+		return { attributes: ["type=branch_summary"], text: entry.summary ?? "" };
+	}
+	if (entry?.type === "custom_message") {
+		return { attributes: ["type=custom_message"], text: entry.content ?? "" };
+	}
+	return { attributes: [`type=${entry?.type ?? "unknown"}`], text: JSON.stringify(entry, null, 2) };
+}
+
+function renderEntryView(entry: any, offset: number, limit?: number): { text: string; totalLines: number; shownLines: number } {
+	const view = entryViewContent(entry);
+	const lines = view.text.split("\n");
+	const start = offset - 1;
+	if (start >= lines.length) throw new Error(`Offset ${offset} is beyond end of entry (${lines.length} lines total).`);
+	const end = limit == null ? lines.length : Math.min(lines.length, start + limit);
 	const body = lines.slice(start, end).join("\n");
-	const suffix = end < lines.length ? `\n\n[Showing lines ${start + 1}-${end} of ${lines.length}. Use offset=${end} to continue.]` : "";
-	return `entry [${String(entry.id ?? "").slice(0, 8)}] ${formatTimestampSecond(normalizeTimestamp(entry.timestamp))}\n${body}${suffix}`;
+	const suffix = end < lines.length ? `\n\n[Showing lines ${offset}-${end} of ${lines.length}. Use offset=${end + 1} to continue.]` : "";
+	const header = `entry [${String(entry.id ?? "").slice(0, 8)}] ${view.attributes.join(" ")} time=${formatTimestampSecond(normalizeTimestamp(entry.timestamp))}`;
+	return {
+		text: `${header}\n\n${body}${suffix}`,
+		totalLines: lines.length,
+		shownLines: end - start,
+	};
 }
 
 // ============================================================================
@@ -915,43 +961,59 @@ export default function (pi: ExtensionAPI) {
 		name: "tape",
 		label: "Tape",
 		description: [
-			"Tape-style context management.",
-			"anchor: create a semantic boundary with summary.",
-			"search: find old entries by keyword with optional kind and time filters.",
-			"info: show current tape boundary, notes status, and context usage.",
+			"Manage semantic context with anchors and searchable history.",
+			"anchor: create a semantic boundary with a slug and retrospective summary.",
 			"view: list anchors and compact records, or display an entry by entryId.",
+			"search: find old entries by text with optional kind and time filters.",
+			"info: show the active boundary, anchor counts, and context usage.",
 		].join(" "),
 		promptSnippet: "Manage semantic context with anchors and searchable history",
 		promptGuidelines: [
-			"Use tape(action='anchor', name=..., summary=...) when switching topics or after a major task completes.",
-			"When context usage is high, use tape(action='anchor') to checkpoint before continuing.",
-			"Use tape(action='view') to discover anchors and compact records, or tape(action='view', entryId=...) to inspect a search result.",
+			"Use tape(action='anchor', name=..., summary=...) when switching topics, after a major task completes, or before continuing when context usage is high.",
+			"Use tape(action='view') to list records. To inspect a search result, pass its entryId and sessionFile when present.",
 			"Use tape(action='search', query=...) to recover old messages, tool results, or prior context when returning to an older topic.",
-			"Use tape(action='info') to check anchor count and context usage.",
-			"Prefer pi-style structured summaries: Goal, Constraints & Preferences, Progress, Key Decisions, Next Steps, Critical Context.",
+			"Use tape(action='info') to check the active boundary and context usage.",
+			"For tape anchor summaries, prefer: Goal, Constraints & Preferences, Progress, Key Decisions, Next Steps, Critical Context.",
 		],
 		parameters: Type.Object({
 			action: StringEnum(["info", "anchor", "view", "search"] as const, {
 				description: "Action to perform",
 			}),
-			name: Type.Optional(Type.String({ description: "Anchor name (unique per branch). Required for anchor." })),
-			summary: Type.Optional(Type.String({ description: "Retrospective state summary. Required for anchor." })),
-			entryId: Type.Optional(Type.String({ description: "Entry ID/prefix to display with action='view'." })),
-			sessionFile: Type.Optional(Type.String({ description: "Session file path for entry lookup, usually from search results." })),
-			query: Type.Optional(Type.String({ description: "Search query. Space means AND; | means OR. Optional when start/end is set." })),
-			start: Type.Optional(Type.String({ description: "Inclusive timestamp lower bound for search." })),
-			end: Type.Optional(Type.String({ description: "Inclusive timestamp upper bound for search." })),
-			kinds: Type.Optional(Type.Array(StringEnum(SEARCH_KINDS, {
-				description: "Entry kinds to search. Default: message + tool_result.",
-			}))),
-			scope: Type.Optional(StringEnum(["branch", "session", "cwd", "all"] as const, {
-				description: "Scope. Default: session for search, cwd for view.",
+			name: Type.Optional(Type.String({
+				description: "Anchor slug, unique per branch (required for anchor; compact/ prefix is reserved)",
+				minLength: 1,
+				maxLength: ANCHOR_NAME_MAX_LENGTH,
+				pattern: ANCHOR_NAME_PATTERN.source,
 			})),
-			limit: Type.Optional(Type.Number({ description: "Maximum items to return (lines when viewing an entry). Defaults: 20 records, 200 entry lines, 10 search results." })),
-			offset: Type.Optional(Type.Number({ description: "Number of items to skip (lines when viewing an entry). Default: 0." })),
+			summary: Type.Optional(Type.String({
+				description: "Retrospective state summary (required for anchor)",
+				minLength: 1,
+				pattern: "\\S",
+			})),
+			entryId: Type.Optional(Type.String({ description: "Entry ID or prefix to display (view only)" })),
+			sessionFile: Type.Optional(Type.String({ description: "Session file for entry lookup (requires entryId; usually returned by search)" })),
+			query: Type.Optional(Type.String({ description: "Case-insensitive substring query; spaces mean AND, | means OR (optional when start/end is set)" })),
+			start: Type.Optional(Type.String({ description: "Inclusive start time: ISO timestamp or YYYY-MM-DD (local day start)." })),
+			end: Type.Optional(Type.String({ description: "Inclusive end time: ISO timestamp or YYYY-MM-DD (local day end)." })),
+			kinds: Type.Optional(Type.Array(StringEnum(SEARCH_KINDS), {
+				description: "Entry kinds to search (default: message + tool_result)",
+			})),
+			scope: Type.Optional(StringEnum(["branch", "session", "cwd", "all"] as const, {
+				description: "Search/view scope (default: session for search, cwd for view)",
+			})),
+			limit: Type.Optional(Type.Integer({ description: "Maximum records, search results, or entry lines (defaults: 20 records, 10 results; no explicit entry limit)" })),
+			offset: Type.Optional(Type.Integer({ description: "Pagination offset (lists: 0-based, default 0; entry lines: 1-based, default 1)" })),
 		}),
 		renderCall(args, theme, context) {
-			return renderToolCall("tape", args, theme, !context.isPartial);
+			const resultReady = !context.isPartial;
+			return renderToolCall(
+				"tape",
+				args,
+				theme,
+				resultReady,
+				resultReady && !context.isError,
+				context.lastComponent,
+			);
 		},
 		async execute(_id, params, signal, _onUpdate, ctx) {
 			if (signal?.aborted) throw new Error("Tape operation cancelled.");
@@ -963,36 +1025,41 @@ export default function (pi: ExtensionAPI) {
 			switch (params.action) {
 				// ── info ─────────────────────────────────────────
 				case "info": {
-					const currentBranchAnchors = anchorRecordsFromEntries(branchEntries, sessionFile, ctx.cwd);
+					const currentBranchRecords = tapeRecordsFromEntries(branchEntries, sessionFile, ctx.cwd);
+					const currentBranchAnchors = currentBranchRecords.filter((record) => record.kind === "anchor");
 					const sessionAnchors = anchorRecordsFromEntries(sessionEntries, sessionFile, ctx.cwd);
-					const latest = currentBranchAnchors.at(-1);
-					const usage = ctx.getContextUsage?.();
-					const globalNotes = readNotesFile(globalNotesPath());
-					const projectNotes = readNotesFile(projectNotesPath(ctx.cwd));
+					const boundary = currentBranchRecords.at(-1);
+					const boundaryIndex = boundary ? branchEntries.findIndex((entry: any) => entry.id === boundary.entryId) : -1;
+					const entriesAfterBoundary = boundaryIndex >= 0 ? branchEntries.length - boundaryIndex - 1 : null;
+					const usage = ctx.getContextUsage?.() ?? null;
+					const boundaryLabel = boundary
+						? `${boundary.name} [${boundary.entryId.slice(0, 8)}] ${formatTimestampSecond(boundary.timestamp)}`
+						: "(none)";
 					const lines = [
+						`active boundary: ${boundaryLabel}`,
 						`branch anchors: ${currentBranchAnchors.length}`,
 						`session anchors: ${sessionAnchors.length}`,
-						`latest boundary: ${latest ? latest.name : "(none)"}`,
-						`notes (global): ${globalNotes.exists ? notesStatusLabel(globalNotes) : `none — ${displayPath(globalNotes.path)}`}`,
-						`notes (project): ${projectNotes.exists ? notesStatusLabel(projectNotes) : `none — ${displayPath(projectNotes.path)}`}`,
 					];
 					if (usage?.tokens != null) {
 						lines.push(`context: ${usage.tokens}/${usage.contextWindow}`);
 					}
-					if (latest) {
-						const anchorIdx = branchEntries.findIndex((e: any) => e.id === latest.entryId);
-						if (anchorIdx >= 0) {
-							lines.push(`entries after boundary: ${branchEntries.length - anchorIdx - 1}`);
-						}
+					if (entriesAfterBoundary != null) {
+						lines.push(`entries after boundary: ${entriesAfterBoundary}`);
 					}
 					return {
 						content: [{ type: "text", text: lines.join("\n") }],
 						details: {
-						branchAnchors: currentBranchAnchors.length,
-						sessionAnchors: sessionAnchors.length,
-						latest: latest ? { entryId: latest.entryId, name: latest.name, timestamp: latest.timestamp } : undefined,
-						usage,
-					},
+							branchAnchors: currentBranchAnchors.length,
+							sessionAnchors: sessionAnchors.length,
+							boundary: boundary ? {
+								kind: boundary.kind,
+								entryId: boundary.entryId,
+								name: boundary.name,
+								timestamp: boundary.timestamp,
+							} : null,
+							entriesAfterBoundary,
+							usage,
+						},
 					};
 				}
 
@@ -1000,6 +1067,12 @@ export default function (pi: ExtensionAPI) {
 				case "anchor": {
 					if (!params.name || !params.summary) {
 						throw new Error("`name` and `summary` are required for anchor.");
+					}
+					if (!params.summary.trim()) {
+						throw new Error("`summary` must contain at least one non-whitespace character.");
+					}
+					if (params.name.length > ANCHOR_NAME_MAX_LENGTH || !ANCHOR_NAME_PATTERN.test(params.name)) {
+						throw new Error(`Anchor name must be a lowercase slug of at most ${ANCHOR_NAME_MAX_LENGTH} characters; use hyphens within segments and / between segments.`);
 					}
 					if (params.name.startsWith("compact/")) {
 						throw new Error("Anchor names starting with `compact/` are reserved for compact records.");
@@ -1010,30 +1083,25 @@ export default function (pi: ExtensionAPI) {
 						throw new Error(`Anchor "${params.name}" already exists on this branch at [${existing.entryId.slice(0, 8)}]. Choose a new name.`);
 					}
 
-					const keepRecentTokens = DEFAULT_KEEP_RECENT_TOKENS;
-					const firstKeptEntryId = calculateFirstKeptEntryId(branchEntries, keepRecentTokens);
-
 					const tapeAnchor: TapeAnchorData = {
 						version: 1,
 						name: params.name,
 						summary: params.summary,
-						keepRecentTokens,
-						firstKeptEntryId,
+						keepRecentTokens: DEFAULT_KEEP_RECENT_TOKENS,
 						createdAt: new Date().toISOString(),
 						source: {
 							cwd: ctx.cwd,
 							sessionFile,
-							leafId: ctx.sessionManager.getLeafId() ?? undefined,
 						},
 					};
 
 					const priorAnchors = currentBranchAnchors.slice(-RECENT_ANCHORS_LIMIT).reverse();
 					const priorLine = priorAnchors.length > 0
-						? `\n\nrecent anchors (this session): ${priorAnchors.map(anchorItemLabel).join(" · ")}`
+						? `\n\nrecent anchors (this branch): ${priorAnchors.map(anchorItemLabel).join(" · ")}`
 						: "";
 
 					return {
-						content: [{ type: "text", text: `[Anchor: ${params.name}]\n${params.summary}${priorLine}` }],
+						content: [{ type: "text", text: `Anchor created: ${params.name}\n${params.summary}${priorLine}` }],
 						details: { tapeAnchor },
 					};
 				}
@@ -1041,11 +1109,17 @@ export default function (pi: ExtensionAPI) {
 				// ── view ────────────────────────────────────────
 				case "view": {
 					const scope = params.scope ?? "cwd";
-					const limit = Math.max(1, Math.trunc(params.limit ?? (params.entryId ? 200 : 20)));
-					const offset = Math.max(0, Math.trunc(params.offset ?? 0));
+					if (params.entryId !== undefined && !params.entryId.trim()) {
+						throw new Error("`entryId` must be a non-empty entry ID or prefix.");
+					}
+					if (params.sessionFile !== undefined && params.entryId === undefined) {
+						throw new Error("`sessionFile` requires `entryId`.");
+					}
 
-					if (params.entryId) {
+					if (params.entryId !== undefined) {
 						const entryId = params.entryId;
+						const limit = params.limit === undefined ? undefined : Math.max(1, Math.trunc(params.limit));
+						const offset = Math.max(1, Math.trunc(params.offset ?? 1));
 						const candidates: Array<{ entry: any; file?: string; cwd?: string }> = [];
 						const addMatches = (entries: any[], file?: string, cwd?: string) => {
 							for (const entry of entries) {
@@ -1054,6 +1128,9 @@ export default function (pi: ExtensionAPI) {
 						};
 
 						if (params.sessionFile) {
+							if (!isManagedSessionFile(params.sessionFile, sessionDir, sessionFile)) {
+								throw new Error("`sessionFile` must be the current session or a file from the configured session directories.");
+							}
 							const parsed = sessionEntriesForScan({ file: params.sessionFile }, sessionFile, sessionEntries, ctx.cwd);
 							if (parsed) addMatches(parsed.entries, parsed.file, parsed.cwd);
 						} else if (scope === "branch") {
@@ -1071,19 +1148,34 @@ export default function (pi: ExtensionAPI) {
 						}
 
 						if (candidates.length === 0) {
-							throw new Error(`No entry matching ${entryId}.`);
+							throw new Error("No entry matches the provided `entryId` prefix.");
 						}
 						if (candidates.length > 1) {
-							const lines = candidates.slice(0, 10).map((c) => `- [${c.entry.id.slice(0, 8)}] session=${sessionLabel({ sessionFile: c.file }, sessionFile)} time=${formatTimestampSecond(normalizeTimestamp(c.entry.timestamp))}`);
-							throw new Error(`Entry prefix ${entryId} is ambiguous (${candidates.length} matches):\n${lines.join("\n")}`);
+							const lines = candidates.slice(0, 10).map((candidate) => {
+								const candidateFile = candidate.file ? JSON.stringify(candidate.file) : "(current)";
+								return `- entryId=${JSON.stringify(candidate.entry.id)} sessionFile=${candidateFile} time=${formatTimestampSecond(normalizeTimestamp(candidate.entry.timestamp))}`;
+							});
+							throw new Error(`The provided \`entryId\` prefix is ambiguous (${candidates.length} matches):\n${lines.join("\n")}\nChoose one candidate and retry with its full entryId and sessionFile when available.`);
 						}
 
 						const found = candidates[0];
+						const rendered = renderEntryView(found.entry, offset, limit);
 						return {
-							content: [{ type: "text", text: renderEntryView(found.entry, offset, limit) }],
-							details: { entryId: found.entry.id, sessionFile: found.file, sessionCwd: found.cwd, offset, limit },
+							content: [{ type: "text", text: rendered.text }],
+							details: {
+								entryId: found.entry.id,
+								sessionFile: found.file,
+								sessionCwd: found.cwd,
+								totalLines: rendered.totalLines,
+								shownLines: rendered.shownLines,
+								offset,
+								limit: limit ?? null,
+							},
 						};
 					}
+
+					const limit = Math.max(1, Math.trunc(params.limit ?? 20));
+					const offset = Math.max(0, Math.trunc(params.offset ?? 0));
 
 					if (scope === "branch" || scope === "session") {
 						const sessionRecords = tapeRecordsFromEntries(sessionEntries, sessionFile, ctx.cwd);
@@ -1100,14 +1192,10 @@ export default function (pi: ExtensionAPI) {
 							];
 						}
 
-						if (ordered.length === 0) {
-							return { content: [{ type: "text", text: "No records found." }], details: { records: 0 } };
-						}
-
 						const shown = ordered.slice(offset, offset + limit);
 						return {
 							content: [{ type: "text", text: renderViewResults(shown, ordered.length, offset, sessionFile) }],
-							details: { total: ordered.length, shown: shown.length, offset, limit },
+							details: { total: ordered.length, shown: shown.length, offset, limit, scope },
 						};
 					}
 
@@ -1120,7 +1208,7 @@ export default function (pi: ExtensionAPI) {
 					const page = dedupedRecords.slice(offset, offset + limit);
 
 					return {
-						content: [{ type: "text", text: renderCrossSessionView(page, total, offset, scope, sessionFile) }],
+						content: [{ type: "text", text: renderCrossSessionView(page, total, offset, sessionFile) }],
 						details: { total, shown: page.length, offset, limit, scope },
 					};
 				}
@@ -1139,8 +1227,13 @@ export default function (pi: ExtensionAPI) {
 					const scope = params.scope ?? "session";
 					const kinds = normalizeSearchKinds(params.kinds);
 					const queryExpr = parseQuery(query);
+					if (query.trim() && queryExpr.length === 0) {
+						throw new Error("`query` must contain a search term.");
+					}
+					if (start.value != null && end.value != null && start.value > end.value) {
+						throw new Error("`start` must be before or equal to `end`.");
+					}
 					const timeFilter = { start: start.value, end: end.value };
-					const timeFilterLabel = `${params.start ? ` start=${params.start}` : ""}${params.end ? ` end=${params.end}` : ""}`;
 					const limit = Math.max(1, Math.trunc(params.limit ?? 10));
 					const offset = Math.max(0, Math.trunc(params.offset ?? 0));
 
@@ -1168,16 +1261,16 @@ export default function (pi: ExtensionAPI) {
 					const page = dedupedMatches.slice(offset, offset + limit);
 
 					return {
-						content: [{ type: "text", text: renderSearchResults(page, total, offset, query, kinds, timeFilterLabel, sessionFile, scope === "cwd" || scope === "all") }],
+						content: [{ type: "text", text: renderSearchResults(page, total, offset, sessionFile, scope === "cwd" || scope === "all") }],
 						details: {
 							results: page.map((result) => ({
 								entryId: result.entryId,
 								timestamp: result.timestamp,
 								kind: result.kind,
 								role: result.role,
+								toolName: result.toolName,
 								sessionFile: result.sessionFile,
 								sessionCwd: result.sessionCwd,
-								sourceSessionFile: result.sourceSessionFile,
 							})),
 							total,
 							offset,

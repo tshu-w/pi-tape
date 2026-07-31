@@ -55,20 +55,13 @@ test("injection: notes content and line budget label", async () => {
 	assert.match(sp, /global \(.*notes\.md, 2\/150 lines\):/);
 });
 
-test("info reports notes status", async () => {
-	const info = await tools.tape.execute("t1", { action: "info" }, undefined, undefined, ctx);
-	const text = info.content[0].text;
-	assert.match(text, /notes \(global\): .*2\/150 lines/);
-	assert.match(text, /notes \(project\): none — /);
-});
-
 test("anchor result carries the summary; system prompt snapshot stays frozen", async () => {
 	const before = await inject();
 	const result = await tools.tape.execute("t2", { action: "anchor", name: "new-topic", summary: "Testing." }, undefined, undefined, ctx);
 	const text = result.content[0].text;
-	assert.ok(text.includes("[Anchor: new-topic]"));
+	assert.ok(text.includes("Anchor created: new-topic"));
 	assert.ok(text.includes("Testing."));
-	assert.ok(!text.includes("recent anchors (this session)"), "first anchor has no prior-anchor list");
+	assert.ok(!text.includes("recent anchors (this branch)"), "first anchor has no prior-anchor list");
 
 	branch.push({ type: "message", id: "bbbb2222-0000", timestamp: new Date().toISOString(), message: { role: "toolResult", toolName: "tape", content: result.content, details: result.details } });
 	const after = await inject();
@@ -76,7 +69,7 @@ test("anchor result carries the summary; system prompt snapshot stays frozen", a
 	assert.ok(!after.includes("new-topic"));
 
 	const second = await tools.tape.execute("t3", { action: "anchor", name: "second-topic", summary: "More." }, undefined, undefined, ctx);
-	assert.match(second.content[0].text, /recent anchors \(this session\): \[new-topic\] \d{4}-\d{2}-\d{2}/);
+	assert.match(second.content[0].text, /recent anchors \(this branch\): \[new-topic\] \d{4}-\d{2}-\d{2}/);
 	assert.ok(!second.content[0].text.includes("[second-topic]"), "current anchor is only in the title");
 });
 

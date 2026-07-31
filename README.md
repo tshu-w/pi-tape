@@ -2,6 +2,8 @@
 
 [Tape](https://tape.systems/)-style context management for [pi](https://pi.dev).
 
+Requires pi 0.81.1 or later.
+
 ## Install
 
 ```bash
@@ -12,10 +14,10 @@ pi install git:github.com/tshu-w/pi-tape
 
 | Action | Description |
 |---|---|
-| `anchor` | Create a semantic boundary with name and summary |
+| `anchor` | Create a semantic boundary with a slug and retrospective summary |
 | `view` | List anchors and compact records, or display an entry by `entryId` |
 | `search` | Find old entries by query, kind, and timestamp filters |
-| `info` | Show current tape boundary, notes status, and context usage |
+| `info` | Show the active boundary, anchor counts, and context usage |
 
 ## Notes
 
@@ -59,12 +61,8 @@ Default search kinds are `message` + `tool_result`; anchors are searchable with 
 
 - Context is rebuilt from the latest anchor: summary is injected as conversation history, followed by a window of messages kept via pi's compact cut points.
 - Native compaction and anchors coexist; the later boundary wins. Manual, threshold, and overflow compaction summarize the effective anchor-projected context, not the raw branch.
-- Anchor-projected compaction cannot forward a custom stream function because pi's `ExtensionContext` does not expose the active agent `streamFn`. Providers that require a custom stream implementation are unsupported for compaction while an anchor is active; standard provider transports are unaffected.
-- Anchor names are unique per branch; names starting with `compact/` are reserved for compact records.
-- `view` defaults to `scope='cwd'`, listing anchors and compact records across all sessions in the same working directory for cross-session discovery. `search` defaults to `scope='session'`.
-- Cross-session record listings (`view` and the injected recent-anchors list) are cached in `<agent-dir>/tape/index.json`, keyed by session-file mtime — closed session files are parsed once. Full-text `search` still scans files. The index is a disposable cache: corrupt or missing, it is rebuilt lazily.
+- Providers that require a custom stream implementation are unsupported for compaction while an anchor is active; standard provider transports are unaffected.
 - Compact summaries appear in `view` and `search` as `compact/YYYYMMDD-HHMMSS` records, but they do not become tape boundaries.
-- Date-only search filters cover whole local days: `start=YYYY-MM-DD` begins at 00:00:00 and `end=YYYY-MM-DD` ends at 23:59:59.999.
 
 ## Testing
 
