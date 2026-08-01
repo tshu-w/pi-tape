@@ -895,7 +895,8 @@ function renderSearchResults(results: SearchResult[], total: number, offset: num
 		return lines.join("\n");
 	});
 	return `search results (${results.length}/${total})\n\n${records.join("\n\n")}` +
-		continuationNotice("results", total, offset, results.length);
+		continuationNotice("results", total, offset, results.length) +
+		'\n\n[Use tape(action="view", entryId="<entryId>", sessionFile="<sessionFile>") to inspect a result.]';
 }
 
 function messageViewText(message: any): string {

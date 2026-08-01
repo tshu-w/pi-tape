@@ -42,7 +42,7 @@ test("search details retain location metadata without copying matched payloads",
 	assert.equal(result.details.results[0].toolName, "bash");
 	assert.match(result.content[0].text, /entryId=search-e kind=tool_result tool=bash time=/);
 	assert.doesNotMatch(result.content[0].text, /role=toolResult/);
-	assert.match(result.content[0].text, /…"$/);
+	assert.match(result.content[0].text, /…"\n\n\[Use tape\(action="view"/);
 });
 
 test("all actions share the final byte and line contract", async () => {
@@ -267,8 +267,10 @@ test("search and record listings provide read-style offset continuation", async 
 	const firstSearch = await tools.tape.execute("search-1", { action: "search", query: "needle", scope: "branch", limit: 1 }, undefined, undefined, searchCtx);
 	assert.match(firstSearch.content[0].text, /^search results \(1\/3\)\n\n- entryId=entry-2 kind=message role=user time=/);
 	assert.match(firstSearch.content[0].text, /\[2 more results\. Use offset=1 to continue\.\]/);
+	assert.match(firstSearch.content[0].text, /\[Use tape\(action="view", entryId="<entryId>", sessionFile="<sessionFile>"\) to inspect a result\.\]$/);
 	const lastSearch = await tools.tape.execute("search-2", { action: "search", query: "needle", scope: "branch", limit: 1, offset: 2 }, undefined, undefined, searchCtx);
 	assert.doesNotMatch(lastSearch.content[0].text, /more results/);
+	assert.match(lastSearch.content[0].text, /\[Use tape\(action="view"/);
 	const pastSearch = await tools.tape.execute("search-3", { action: "search", query: "needle", scope: "branch", limit: 1, offset: 3 }, undefined, undefined, searchCtx);
 	assert.equal(pastSearch.content[0].text, "No entries at offset 3 (total 3).");
 	const zeroSearch = await tools.tape.execute("search-0", { action: "search", query: "needle", scope: "branch", limit: 0 }, undefined, undefined, searchCtx);
