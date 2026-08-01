@@ -36,10 +36,12 @@ import {
 	compact,
 	findCutPoint,
 	getAgentDir,
+	keyText,
 	sessionEntryToContextMessages,
 	truncateHead,
 	type ExtensionAPI,
 } from "@earendil-works/pi-coding-agent";
+import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { renderToolCall } from "./render-call.js";
 import { withToolOutputContract } from "./tool-output.js";
@@ -56,6 +58,8 @@ const NOTES_MAX_LINES = 400;
 const NOTES_MAX_BYTES = 16 * 1024;
 const RECENT_ANCHORS_LIMIT = 10;
 const SEARCH_PREVIEW_LENGTH = 200;
+const COLLAPSED_LIST_ITEMS = 5;
+const COLLAPSED_TEXT_LINES = 15;
 const DEFAULT_SEARCH_KINDS = ["message", "tool_result"] as const;
 const SEARCH_KINDS = ["message", "tool_result", "tool_call", "anchor", "compact", "summary", "custom"] as const;
 const SEARCH_INTERNAL_TOOL_NAMES = new Set(["tape"]);
@@ -820,17 +824,14 @@ function firstSummaryLine(summary: string): string {
 
 function sessionLabel(record: { sessionFile?: string }, currentSessionFile?: string): string {
 	if ((!currentSessionFile && !record.sessionFile) || (currentSessionFile && record.sessionFile === currentSessionFile)) {
-		return "(current)";
+		return "current";
 	}
 	return path.basename(record.sessionFile ?? "unknown").replace(".jsonl", "");
 }
 
 function renderRecordRow(r: TapeRecord, currentSessionFile: string | undefined, indent = ""): string[] {
 	return [
-		`${indent}- name: ${JSON.stringify(r.name)}`,
-		`${indent}  entryId: ${JSON.stringify(r.entryId.slice(0, 8))}`,
-		`${indent}  time: ${JSON.stringify(formatTimestampSecond(r.timestamp))}`,
-		`${indent}  session: ${JSON.stringify(sessionLabel(r, currentSessionFile))}`,
+		`${indent}- name=${r.name} entryId=${r.entryId.slice(0, 8)} time=${formatTimestampSecond(r.timestamp)} session=${sessionLabel(r, currentSessionFile)}`,
 		`${indent}  summary: ${JSON.stringify(firstSummaryLine(r.summary))}`,
 	];
 }
@@ -947,7 +948,7 @@ function renderEntryView(entry: any, offset: number, limit?: number): { text: st
 	const end = limit == null ? lines.length : Math.min(lines.length, start + limit);
 	const body = lines.slice(start, end).join("\n");
 	const suffix = end < lines.length ? `\n\n[Showing lines ${offset}-${end} of ${lines.length}. Use offset=${end + 1} to continue.]` : "";
-	const header = `entry [${String(entry.id ?? "").slice(0, 8)}] ${view.attributes.join(" ")} time=${formatTimestampSecond(normalizeTimestamp(entry.timestamp))}`;
+	const header = `entryId=${String(entry.id ?? "").slice(0, 8)} ${view.attributes.join(" ")} time=${formatTimestampSecond(normalizeTimestamp(entry.timestamp))}`;
 	return {
 		text: `${header}\n\n${body}${suffix}`,
 		totalLines: lines.length,
@@ -1017,6 +1018,72 @@ export default function (pi: ExtensionAPI) {
 				resultReady && !context.isError,
 				context.lastComponent,
 			);
+		},
+		renderResult(result, { expanded }, theme, context) {
+			const text = result.content.find((part) => part.type === "text")?.text ?? "";
+			if (context.isError) return new Text(theme.fg("error", text), 0, 0);
+			if (expanded) return new Text(theme.fg("toolOutput", text), 0, 0);
+
+			if (context.args.action === "view" && context.args.entryId !== undefined) {
+				const shownLines = (result.details as { shownLines?: number } | undefined)?.shownLines;
+				const separator = text.indexOf("\n\n");
+				if (shownLines === undefined || shownLines <= COLLAPSED_TEXT_LINES || separator < 0) {
+					return new Text(theme.fg("toolOutput", text), 0, 0);
+				}
+				const header = text.slice(0, separator);
+				const bodyLines = text.slice(separator + 2).split("\n").slice(0, COLLAPSED_TEXT_LINES);
+				const hidden = shownLines - COLLAPSED_TEXT_LINES;
+				const hint = theme.fg(
+					"dim",
+					`... (${hidden} entry ${hidden === 1 ? "line" : "lines"} hidden, ${keyText("app.tools.expand")} to expand)`,
+				);
+				return new Text(`${theme.fg("toolOutput", header)}\n\n${theme.fg("toolOutput", bodyLines.join("\n"))}\n\n${hint}`, 0, 0);
+			}
+
+			if (context.args.action === "anchor") {
+				const summary = (result.details as { tapeAnchor?: { summary?: string } } | undefined)?.tapeAnchor?.summary;
+				const summaryLines = summary?.split("\n");
+				if (!summaryLines || summaryLines.length <= COLLAPSED_TEXT_LINES) {
+					return new Text(theme.fg("toolOutput", text), 0, 0);
+				}
+				const header = text.split("\n", 1)[0]!;
+				const hidden = summaryLines.length - COLLAPSED_TEXT_LINES;
+				const hint = theme.fg(
+					"dim",
+					`... (${hidden} summary ${hidden === 1 ? "line" : "lines"} hidden, ${keyText("app.tools.expand")} to expand)`,
+				);
+				return new Text(
+					`${theme.fg("toolOutput", header)}\n${theme.fg("toolOutput", summaryLines.slice(0, COLLAPSED_TEXT_LINES).join("\n"))}\n\n${hint}`,
+					0,
+					0,
+				);
+			}
+
+			const sections = text.split("\n\n");
+			let itemSections: string[];
+			let itemLabel: "result" | "record";
+			if (context.args.action === "search") {
+				itemSections = sections.filter((section) => section.startsWith("- entryId="));
+				itemLabel = "result";
+			} else if (context.args.action === "view" && context.args.entryId === undefined) {
+				itemSections = sections.filter((section) => /^(?:off-branch:\n)? {0,2}- name=/.test(section));
+				itemLabel = "record";
+			} else {
+				return new Text(theme.fg("toolOutput", text), 0, 0);
+			}
+
+			if (itemSections.length <= COLLAPSED_LIST_ITEMS) {
+				return new Text(theme.fg("toolOutput", text), 0, 0);
+			}
+
+			const visible = [sections[0]!, ...itemSections.slice(0, COLLAPSED_LIST_ITEMS)]
+				.map((section) => theme.fg("toolOutput", section));
+			const hidden = itemSections.length - COLLAPSED_LIST_ITEMS;
+			visible.push(theme.fg(
+				"dim",
+				`... (${hidden} ${itemLabel}${hidden === 1 ? "" : "s"} hidden, ${keyText("app.tools.expand")} to expand)`,
+			));
+			return new Text(visible.join("\n\n"), 0, 0);
 		},
 		async execute(_id, params, signal, _onUpdate, ctx) {
 			if (signal?.aborted) throw new Error("Tape operation cancelled.");

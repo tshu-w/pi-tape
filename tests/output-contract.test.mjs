@@ -84,7 +84,7 @@ test("single-line entry view remains useful and preserves the full rendering", a
 	const ctx = makeCtx({ cwd: "/work", branch: [entry], entries: [entry] });
 	const result = await tools.tape.execute("view", { action: "view", entryId: entry.id, scope: "branch" }, undefined, undefined, ctx);
 	const text = assertBounded(result);
-	assert.ok(text.startsWith("entry [view-ent] type=message role=user time=2026-07-27 00:00:00\n\n"));
+	assert.ok(text.startsWith("entryId=view-ent type=message role=user time=2026-07-27 00:00:00\n\n"));
 	assert.match(text, /Output truncated/);
 	assert.equal(result.details.truncation.firstLineExceedsLimit, false);
 	assert.equal(result.details.truncation.lastLinePartial, false);
@@ -209,7 +209,7 @@ test("semantic failures and cancellation reject while empty results remain succe
 	assert.deepEqual(emptyView.details, { total: 0, shown: 0, offset: 10, limit: 20, scope: "branch" });
 
 	const anchorView = await tools.tape.execute("anchor-view", { action: "view", entryId: existing.id, scope: "branch" }, undefined, undefined, ctx);
-	assert.match(anchorView.content[0].text, /^entry \[anchor-0\] type=anchor name=existing time=/);
+	assert.match(anchorView.content[0].text, /^entryId=anchor-0 type=anchor name=existing time=/);
 	const multiline = { ...entry, id: "multiline-entry", message: textMessage("user", "one\ntwo\nthree") };
 	const pagedView = await tools.tape.execute(
 		"paged-view",
@@ -279,7 +279,7 @@ test("search and record listings provide read-style offset continuation", async 
 	const viewCtx = makeCtx({ cwd: "/work", branch: anchors });
 	const firstView = await tools.tape.execute("view-1", { action: "view", scope: "branch", limit: 1 }, undefined, undefined, viewCtx);
 	assert.match(firstView.content[0].text, /^records \(1\/3\)/);
-	assert.match(firstView.content[0].text, /session: "\(current\)"/);
+	assert.match(firstView.content[0].text, /name=anchor-2 entryId=anchor-2 time=.* session=current/);
 	assert.match(firstView.content[0].text, /summary 2…/);
 	assert.match(firstView.content[0].text, /\[2 more records\. Use offset=1 to continue\.\]/);
 	assert.deepEqual(Object.keys(firstView.details).sort(), ["limit", "offset", "scope", "shown", "total"]);
