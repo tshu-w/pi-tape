@@ -884,13 +884,11 @@ function renderSearchResults(results: SearchResult[], total: number, offset: num
 		return total > 0 ? `No entries at offset ${offset} (total ${total}).` : "No entries found.";
 	}
 	const records = results.map((result) => {
-		const lines = [
-			`- entryId: ${result.entryId.slice(0, 8)}`,
-			`  kind: ${result.kind}`,
-		];
-		if (result.role !== result.kind) lines.push(`  role: ${result.role}`);
-		if (result.toolName) lines.push(`  tool: ${result.toolName}`);
-		lines.push(`  time: ${formatTimestampSecond(result.timestamp)}`);
+		let header = `- entryId=${result.entryId.slice(0, 8)} kind=${result.kind}`;
+		if (result.kind === "message") header += ` role=${result.role}`;
+		if (result.toolName) header += ` tool=${result.toolName}`;
+		header += ` time=${formatTimestampSecond(result.timestamp)}`;
+		const lines = [header];
 		if (showSessionFile) lines.push(`  sessionFile: ${result.sessionFile ?? ""}`);
 		lines.push(`  preview: ${JSON.stringify(result.preview)}`);
 		return lines.join("\n");
