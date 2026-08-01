@@ -163,7 +163,7 @@ test("semantic failures and cancellation reject while empty results remain succe
 		[{ action: "anchor", name: "compact/reserved", summary: "x" }, /reserved/],
 		[{ action: "anchor", name: "bad\nname", summary: "x" }, /lowercase slug.*80 characters/],
 		[{ action: "anchor", name: "Bad-Name", summary: "x" }, /lowercase slug.*80 characters/],
-		[{ action: "anchor", name: "bad_name", summary: "x" }, /lowercase slug.*80 characters/],
+		[{ action: "anchor", name: "bad__name", summary: "x" }, /lowercase slug.*80 characters/],
 		[{ action: "anchor", name: "bad--name", summary: "x" }, /lowercase slug.*80 characters/],
 		[{ action: "anchor", name: "x".repeat(81), summary: "x" }, /lowercase slug.*80 characters/],
 		[{ action: "anchor", name: "existing", summary: "x" }, /already exists/],
@@ -182,6 +182,15 @@ test("semantic failures and cancellation reject while empty results remain succe
 			pattern,
 		);
 	}
+
+	const underscoreAnchor = await tools.tape.execute(
+		"underscore-anchor",
+		{ action: "anchor", name: "valid_name/nested_value", summary: "summary" },
+		undefined,
+		undefined,
+		ctx,
+	);
+	assert.equal(underscoreAnchor.details.tapeAnchor.name, "valid_name/nested_value");
 
 	const controller = new AbortController();
 	controller.abort();
@@ -216,7 +225,7 @@ test("pagination parameters describe their shared semantics", async () => {
 	const properties = tools.tape.parameters.properties;
 	assert.match(tools.tape.promptGuidelines.join("\n"), /Use tape\(action='anchor'/);
 	assert.equal(properties.name.maxLength, 80);
-	assert.equal(properties.name.pattern, "^[a-z0-9]+(?:-[a-z0-9]+)*(?:\\/[a-z0-9]+(?:-[a-z0-9]+)*)*$");
+	assert.equal(properties.name.pattern, "^[a-z0-9]+(?:[-_][a-z0-9]+)*(?:\\/[a-z0-9]+(?:[-_][a-z0-9]+)*)*$");
 	assert.equal(properties.summary.minLength, 1);
 	assert.equal(properties.summary.pattern, "\\S");
 	assert.equal(properties.query.description, "Case-insensitive substring query; spaces mean AND, | means OR (optional when start/end is set)");

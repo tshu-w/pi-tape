@@ -50,7 +50,7 @@ import { withToolOutputContract } from "./tool-output.js";
 
 const DEFAULT_KEEP_RECENT_TOKENS = 20000;
 const ANCHOR_NAME_MAX_LENGTH = 80;
-const ANCHOR_NAME_PATTERN = /^[a-z0-9]+(?:-[a-z0-9]+)*(?:\/[a-z0-9]+(?:-[a-z0-9]+)*)*$/;
+const ANCHOR_NAME_PATTERN = /^[a-z0-9]+(?:[-_][a-z0-9]+)*(?:\/[a-z0-9]+(?:[-_][a-z0-9]+)*)*$/;
 const NOTES_BUDGET_LINES = 150;
 const NOTES_MAX_LINES = 400;
 const NOTES_MAX_BYTES = 16 * 1024;
@@ -1077,7 +1077,7 @@ export default function (pi: ExtensionAPI) {
 						throw new Error("`summary` must contain at least one non-whitespace character.");
 					}
 					if (params.name.length > ANCHOR_NAME_MAX_LENGTH || !ANCHOR_NAME_PATTERN.test(params.name)) {
-						throw new Error(`Anchor name must be a lowercase slug of at most ${ANCHOR_NAME_MAX_LENGTH} characters; use hyphens within segments and / between segments.`);
+						throw new Error(`Anchor name must be a lowercase slug of at most ${ANCHOR_NAME_MAX_LENGTH} characters; use hyphens or underscores within segments and / between segments.`);
 					}
 					if (params.name.startsWith("compact/")) {
 						throw new Error("Anchor names starting with `compact/` are reserved for compact records.");
