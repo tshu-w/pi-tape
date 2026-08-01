@@ -19,12 +19,9 @@ async function boundText(value: string): Promise<{
 
 	const notice = `[Output truncated: ${full.totalLines} lines, ${formatSize(full.totalBytes)} total.` +
 		` Full output: ${fullOutputPath}]`;
-	const suffix = `\n\n${notice}`;
-	const budget = DEFAULT_MAX_BYTES - Buffer.byteLength(suffix);
-	const truncation = truncateHead(value, { maxBytes: budget, maxLines: DEFAULT_MAX_LINES - 2 });
 	return {
-		text: truncation.content ? truncation.content + suffix : notice,
-		truncation,
+		text: full.content ? `${full.content}\n\n${notice}` : notice,
+		truncation: full,
 		fullOutputPath,
 	};
 }

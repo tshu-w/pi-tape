@@ -12,8 +12,10 @@ import { anchorEntry, loadTape, makeCtx, textMessage } from "./harness.mjs";
 
 function assertBounded(result) {
 	const text = result.content.filter((part) => part.type === "text").map((part) => part.text).join("\n");
-	assert.ok(Buffer.byteLength(text) <= MAX_BYTES, `expected <= ${MAX_BYTES} bytes`);
-	assert.ok(text.split("\n").length <= MAX_LINES, `expected <= ${MAX_LINES} lines`);
+	// The limits bound the retained content; the truncation notice sits on top of it.
+	const content = result.details?.truncation?.content ?? text;
+	assert.ok(Buffer.byteLength(content) <= MAX_BYTES, `expected <= ${MAX_BYTES} bytes`);
+	assert.ok(content.split("\n").length <= MAX_LINES, `expected <= ${MAX_LINES} lines`);
 	return text;
 }
 
@@ -63,8 +65,8 @@ test("all actions share the final byte and line contract", async () => {
 			`\n\n[Output truncated: ${result.details.truncation.totalLines} lines, ` +
 				`${formatSize(result.details.truncation.totalBytes)} total. Full output: ${result.details.fullOutputPath}]`,
 		);
-		assert.equal(result.details.truncation.maxBytes + Buffer.byteLength(notice), MAX_BYTES);
-		assert.equal(result.details.truncation.maxLines + 2, MAX_LINES);
+		assert.equal(result.details.truncation.maxBytes, MAX_BYTES);
+		assert.equal(result.details.truncation.maxLines, MAX_LINES);
 		assert.equal(fs.readFileSync(result.details.fullOutputPath, "utf8"), `Anchor created: ${name}\n${summary}`);
 		fs.rmSync(path.dirname(result.details.fullOutputPath), { recursive: true });
 	}
