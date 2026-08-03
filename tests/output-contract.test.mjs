@@ -267,7 +267,7 @@ test("search and record listings provide read-style offset continuation", async 
 	const firstSearch = await tools.tape.execute("search-1", { action: "search", query: "needle", scope: "branch", limit: 1 }, undefined, undefined, searchCtx);
 	assert.match(firstSearch.content[0].text, /^search results \(1\/3\)\n\n- entryId=entry-2 kind=message role=user time=/);
 	assert.match(firstSearch.content[0].text, /\[2 more results\. Use offset=1 to continue\.\]/);
-	assert.match(firstSearch.content[0].text, /\[Use tape\(action="view", entryId="<entryId>", sessionFile="<sessionFile>"\) to inspect a result\.\]$/);
+	assert.match(firstSearch.content[0].text, /\[Use tape\(action="view", entryId=\.\.\., sessionFile=\.\.\.\) to inspect an entry\.\]$/);
 	const lastSearch = await tools.tape.execute("search-2", { action: "search", query: "needle", scope: "branch", limit: 1, offset: 2 }, undefined, undefined, searchCtx);
 	assert.doesNotMatch(lastSearch.content[0].text, /more results/);
 	assert.match(lastSearch.content[0].text, /\[Use tape\(action="view"/);
