@@ -115,9 +115,23 @@ test("project notes get injected", async () => {
 	assert.ok(sp.includes("repo tests need bun"));
 });
 
-test("view scope=cwd lists records through the index", async () => {
-	const view = await tools.tape.execute("t4", { action: "view" }, undefined, undefined, ctx);
-	assert.ok(view.content[0].text.includes("past-topic"));
+test("view defaults to session while scope=cwd lists records through the index", async () => {
+	const currentAnchor = anchorEntry({
+		id: "dddd4444-0000",
+		name: "current-topic",
+		summary: "Current session summary.",
+		cwd,
+		createdAt: "2026-07-21T10:00:00.000Z",
+	});
+	const viewCtx = makeCtx({ cwd, sessionFile, branch: [currentAnchor] });
+
+	const sessionView = await tools.tape.execute("t4", { action: "view" }, undefined, undefined, viewCtx);
+	assert.equal(sessionView.details.scope, "session");
+	assert.ok(sessionView.content[0].text.includes("current-topic"));
+	assert.ok(!sessionView.content[0].text.includes("past-topic"));
+
+	const cwdView = await tools.tape.execute("t5", { action: "view", scope: "cwd" }, undefined, undefined, viewCtx);
+	assert.ok(cwdView.content[0].text.includes("past-topic"));
 });
 
 test.after(() => fs.rmSync(agentDir, { recursive: true, force: true }));

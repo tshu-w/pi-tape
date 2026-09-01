@@ -53,7 +53,7 @@ Recall follows the grep → read pattern:
 1. `search(query=...)` returns bounded previews with entry IDs. Space means AND, `|` means OR. Optional `kinds` and `start`/`end` filters narrow results.
 2. `view(entryId=...)` displays the full entry content with line pagination (`offset`/`limit`).
 
-Cross-session searches (`scope="cwd"` or `"all"`) render `session`, complete `sessionFile`, and `time` metadata per result; pass that `sessionFile` to `view` when opening entries from other sessions.
+For cross-session recall, search with `scope="cwd"` or `"all"`, then pass the returned `sessionFile` to `view`.
 
 Default search kinds are `message` + `tool_result`; anchors are searchable with `kinds=["anchor"]`. Tape's own tool calls/results are excluded from search indexing to avoid echoing previous searches.
 

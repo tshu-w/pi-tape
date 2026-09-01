@@ -1004,7 +1004,7 @@ export default function (pi: ExtensionAPI) {
 				description: "Entry kinds to search (default: message + tool_result)",
 			})),
 			scope: Type.Optional(StringEnum(["branch", "session", "cwd", "all"] as const, {
-				description: "Search/view scope (default: session for search, cwd for view)",
+				description: "Search/view scope (default: session)",
 			})),
 			limit: Type.Optional(Type.Integer({ description: "Maximum records, search results, or entry lines (defaults: 20 records, 10 results; no explicit entry limit)" })),
 			offset: Type.Optional(Type.Integer({ description: "Pagination offset (lists: 0-based, default 0; entry lines: 1-based, default 1)" })),
@@ -1179,7 +1179,7 @@ export default function (pi: ExtensionAPI) {
 
 				// ── view ────────────────────────────────────────
 				case "view": {
-					const scope = params.scope ?? "cwd";
+					const scope = params.scope ?? "session";
 					if (params.entryId !== undefined && !params.entryId.trim()) {
 						throw new Error("`entryId` must be a non-empty entry ID or prefix.");
 					}
