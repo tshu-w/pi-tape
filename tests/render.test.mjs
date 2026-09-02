@@ -127,6 +127,48 @@ test("anchor results collapse after fifteen summary lines", () => {
 	assert.equal(expanded, content);
 });
 
+test("hard truncation stays visible as a warning while navigation hints stay subdued", () => {
+	const styles = [];
+	const theme = {
+		bold: (text) => text,
+		fg: (color, text) => { styles.push([color, text]); return text; },
+	};
+	const records = Array.from({ length: 6 }, (_, index) =>
+		`- entryId=id${index + 1} kind=message role=user time=2026-08-01 00:00:0${index + 1}\n  preview: "result ${index + 1}"`,
+	);
+	const notice = "[Output truncated: 100 lines. Full output: /tmp/tape.txt]";
+	const content = `search results (6/20)\n\n${records.join("\n\n")}\n\n${notice}`;
+	const result = { content: [{ type: "text", text: content }], details: { truncation: { truncated: true } } };
+	const context = { args: { action: "search" }, isError: false };
+
+	const collapsed = tools.tape.renderResult(result, { expanded: false, isPartial: false }, theme, context)
+		.render(1000).map((line) => line.trimEnd()).join("\n");
+	assert.match(collapsed, /\[Output truncated:/);
+	assert.ok(styles.some(([color, text]) => color === "warning" && text === notice));
+
+	styles.length = 0;
+	const omittedSummary = Array.from({ length: 20 }, (_, index) => `omitted summary ${index + 1}`).join("\n");
+	const noticeOnly = tools.tape.renderResult(
+		{ content: [{ type: "text", text: notice }], details: { truncation: { truncated: true }, tapeAnchor: { summary: omittedSummary } } },
+		{ expanded: false, isPartial: false },
+		theme,
+		{ args: { action: "anchor" }, isError: false },
+	).render(1000).map((line) => line.trimEnd()).join("\n");
+	assert.equal(noticeOnly, notice);
+	assert.doesNotMatch(noticeOnly, /omitted summary/);
+	assert.ok(styles.some(([color, text]) => color === "warning" && text === notice));
+
+	styles.length = 0;
+	const hint = '[Use tape(action="view", entryId=..., sessionFile=...) to inspect an entry.]';
+	tools.tape.renderResult(
+		{ content: [{ type: "text", text: hint }], details: {} },
+		{ expanded: true, isPartial: false },
+		theme,
+		context,
+	).render(1000);
+	assert.equal(styles.some(([color]) => color === "warning"), false);
+});
+
 test("anchor summary is shortened only when a successful result repeats it", () => {
 	const theme = { bold: (text) => text, fg: (_color, text) => text };
 	const summary = "H".repeat(150) + "T".repeat(150);

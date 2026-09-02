@@ -40,6 +40,7 @@ import {
 	sessionEntryToContextMessages,
 	truncateHead,
 	type ExtensionAPI,
+	type Theme,
 } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
@@ -836,6 +837,16 @@ function renderRecordRow(r: TapeRecord, currentSessionFile: string | undefined, 
 	];
 }
 
+function styleToolOutput(text: string, truncated: boolean, theme: Theme): string {
+	if (!truncated) return theme.fg("toolOutput", text);
+	const marker = "[Output truncated:";
+	const separatedFooterStart = text.lastIndexOf(`\n\n${marker}`);
+	const footerStart = separatedFooterStart >= 0 ? separatedFooterStart : text.startsWith(marker) ? 0 : -1;
+	if (footerStart < 0) return theme.fg("toolOutput", text);
+	if (footerStart === 0) return theme.fg("warning", text);
+	return `${theme.fg("toolOutput", text.slice(0, footerStart))}\n\n${theme.fg("warning", text.slice(footerStart + 2))}`;
+}
+
 function continuationNotice(unit: "records" | "results", total: number, offset: number, shown: number): string {
 	const nextOffset = offset + shown;
 	const remaining = total - nextOffset;
@@ -1022,30 +1033,36 @@ export default function (pi: ExtensionAPI) {
 		},
 		renderResult(result, { expanded }, theme, context) {
 			const text = result.content.find((part) => part.type === "text")?.text ?? "";
+			const truncated = (result.details as { truncation?: { truncated?: boolean } } | undefined)?.truncation?.truncated === true;
+			const separatedFooterStart = truncated ? text.lastIndexOf("\n\n[Output truncated:") : -1;
+			const footerStart = separatedFooterStart >= 0 ? separatedFooterStart : truncated && text.startsWith("[Output truncated:") ? 0 : -1;
+			const truncationFooter = footerStart >= 0 ? text.slice(footerStart === 0 ? 0 : footerStart + 2) : undefined;
 			if (context.isError) return new Text(theme.fg("error", text), 0, 0);
-			if (expanded) return new Text(theme.fg("toolOutput", text), 0, 0);
+			if (expanded || footerStart === 0) return new Text(styleToolOutput(text, truncated, theme), 0, 0);
 
 			if (context.args.action === "view" && context.args.entryId !== undefined) {
 				const shownLines = (result.details as { shownLines?: number } | undefined)?.shownLines;
 				const separator = text.indexOf("\n\n");
 				if (shownLines === undefined || shownLines <= COLLAPSED_TEXT_LINES || separator < 0) {
-					return new Text(theme.fg("toolOutput", text), 0, 0);
+					return new Text(styleToolOutput(text, truncated, theme), 0, 0);
 				}
 				const header = text.slice(0, separator);
-				const bodyLines = text.slice(separator + 2).split("\n").slice(0, COLLAPSED_TEXT_LINES);
+				const bodyEnd = footerStart >= 0 ? footerStart : text.length;
+				const bodyLines = text.slice(separator + 2, bodyEnd).split("\n").slice(0, COLLAPSED_TEXT_LINES);
 				const hidden = shownLines - COLLAPSED_TEXT_LINES;
 				const hint = theme.fg(
 					"dim",
 					`... (${hidden} entry ${hidden === 1 ? "line" : "lines"} hidden, ${keyText("app.tools.expand")} to expand)`,
 				);
-				return new Text(`${theme.fg("toolOutput", header)}\n\n${theme.fg("toolOutput", bodyLines.join("\n"))}\n\n${hint}`, 0, 0);
+				const footer = truncationFooter ? `\n\n${theme.fg("warning", truncationFooter)}` : "";
+				return new Text(`${theme.fg("toolOutput", header)}\n\n${theme.fg("toolOutput", bodyLines.join("\n"))}\n\n${hint}${footer}`, 0, 0);
 			}
 
 			if (context.args.action === "anchor") {
 				const summary = (result.details as { tapeAnchor?: { summary?: string } } | undefined)?.tapeAnchor?.summary;
 				const summaryLines = summary?.split("\n");
 				if (!summaryLines || summaryLines.length <= COLLAPSED_TEXT_LINES) {
-					return new Text(theme.fg("toolOutput", text), 0, 0);
+					return new Text(styleToolOutput(text, truncated, theme), 0, 0);
 				}
 				const header = text.split("\n", 1)[0]!;
 				const hidden = summaryLines.length - COLLAPSED_TEXT_LINES;
@@ -1053,8 +1070,9 @@ export default function (pi: ExtensionAPI) {
 					"dim",
 					`... (${hidden} summary ${hidden === 1 ? "line" : "lines"} hidden, ${keyText("app.tools.expand")} to expand)`,
 				);
+				const footer = truncationFooter ? `\n\n${theme.fg("warning", truncationFooter)}` : "";
 				return new Text(
-					`${theme.fg("toolOutput", header)}\n${theme.fg("toolOutput", summaryLines.slice(0, COLLAPSED_TEXT_LINES).join("\n"))}\n\n${hint}`,
+					`${theme.fg("toolOutput", header)}\n${theme.fg("toolOutput", summaryLines.slice(0, COLLAPSED_TEXT_LINES).join("\n"))}\n\n${hint}${footer}`,
 					0,
 					0,
 				);
@@ -1070,11 +1088,11 @@ export default function (pi: ExtensionAPI) {
 				itemSections = sections.filter((section) => /^(?:off-branch:\n)? {0,2}- name=/.test(section));
 				itemLabel = "record";
 			} else {
-				return new Text(theme.fg("toolOutput", text), 0, 0);
+				return new Text(styleToolOutput(text, truncated, theme), 0, 0);
 			}
 
 			if (itemSections.length <= COLLAPSED_LIST_ITEMS) {
-				return new Text(theme.fg("toolOutput", text), 0, 0);
+				return new Text(styleToolOutput(text, truncated, theme), 0, 0);
 			}
 
 			const visible = [sections[0]!, ...itemSections.slice(0, COLLAPSED_LIST_ITEMS)]
@@ -1084,6 +1102,7 @@ export default function (pi: ExtensionAPI) {
 				"dim",
 				`... (${hidden} ${itemLabel}${hidden === 1 ? "" : "s"} hidden, ${keyText("app.tools.expand")} to expand)`,
 			));
+			if (truncationFooter) visible.push(theme.fg("warning", truncationFooter));
 			return new Text(visible.join("\n\n"), 0, 0);
 		},
 		async execute(_id, params, signal, _onUpdate, ctx) {
