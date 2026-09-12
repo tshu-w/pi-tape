@@ -10,7 +10,8 @@
  * Native compaction coexists with anchors — whichever boundary is later
  * effectively wins. An active anchor rebuilds model context; native
  * compaction (manual or automatic) summarizes that projected context rather
- * than the raw branch.
+ * than the raw branch. A temporary versioned bridge lets a compatible
+ * provider adapter consume that same projection and return the final result.
  *
  * Recall follows grep -> read: search returns bounded previews; full
  * content is read via view(entryId) with line pagination. Tape's own
@@ -64,6 +65,7 @@ const COLLAPSED_TEXT_LINES = 15;
 const DEFAULT_SEARCH_KINDS = ["message", "tool_result"] as const;
 const SEARCH_KINDS = ["message", "tool_result", "tool_call", "anchor", "compact", "summary", "custom"] as const;
 const SEARCH_INTERNAL_TOOL_NAMES = new Set(["tape"]);
+const PROJECTED_COMPACTION_BRIDGE_SYMBOL = Symbol.for("pi-tape.projected-compaction.v1");
 
 // ============================================================================
 // Types
@@ -723,6 +725,15 @@ interface ActiveAnchorBoundary {
 	anchor: TapeAnchorData;
 }
 
+interface ProjectedCompactionBridge {
+	compact(input: {
+		event: any;
+		context: any;
+		preparation: any;
+		messages: any[];
+	}): Promise<any> | any;
+}
+
 function findActiveAnchorBoundary(entries: any[]): ActiveAnchorBoundary | null {
 	let active: ActiveAnchorBoundary | null = null;
 	for (const entry of entries) {
@@ -742,6 +753,21 @@ function messagesFromEntries(entries: any[], start: number, end: number): any[] 
 		messages.push(...sessionEntryToContextMessages(entries[i]));
 	}
 	return messages;
+}
+
+function projectedCompactionMessages(branchEntries: any[], preparation: any): any[] {
+	const contextEntries = buildContextEntries(branchEntries);
+	const firstKeptIndex = contextEntries.findIndex((entry: any) => entry?.id === preparation.firstKeptEntryId);
+	return [
+		...preparation.messagesToSummarize,
+		...preparation.turnPrefixMessages,
+		...messagesFromEntries(contextEntries, firstKeptIndex, contextEntries.length),
+	];
+}
+
+function projectedCompactionBridge(): ProjectedCompactionBridge | undefined {
+	const value = (globalThis as any)[PROJECTED_COMPACTION_BRIDGE_SYMBOL];
+	return value && typeof value.compact === "function" ? value as ProjectedCompactionBridge : undefined;
 }
 
 export function prepareProjectedAnchorCompaction(
@@ -1416,6 +1442,20 @@ export default function (pi: ExtensionAPI) {
 			event.preparation.fileOps,
 		);
 		if (!preparation) return;
+
+		const bridge = projectedCompactionBridge();
+		if (bridge) {
+			const messages = projectedCompactionMessages(event.branchEntries as any[], preparation);
+			try {
+				const result = await bridge.compact({ event, context: ctx, preparation, messages });
+				if (result) return result;
+			} catch (error) {
+				if (ctx.hasUI) {
+					const message = error instanceof Error ? error.message : String(error);
+					ctx.ui.notify(`Projected compaction adapter failed; using tape text summary. ${message}`, "warning");
+				}
+			}
+		}
 
 		const auth = await ctx.modelRegistry.getApiKeyAndHeaders(ctx.model);
 		if (!auth.ok) throw new Error(`Tape compaction auth failed: ${auth.error}`);

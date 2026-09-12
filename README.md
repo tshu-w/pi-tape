@@ -61,7 +61,7 @@ Default search kinds are `message` + `tool_result`; anchors are searchable with 
 
 - Context is rebuilt from the latest anchor: summary is injected as conversation history, followed by a window of messages kept via pi's compact cut points.
 - Native compaction and anchors coexist; the later boundary wins. Manual, threshold, and overflow compaction summarize the effective anchor-projected context, not the raw branch.
-- Providers that require a custom stream implementation are unsupported for compaction while an anchor is active; standard provider transports are unaffected.
+- Native compaction and compatible provider adapters consume the same projected Anchor context, including the request and tool work before a mid-turn cut. Other custom compaction handlers are unsupported while an anchor is active.
 - Compact summaries appear in `view` and `search` as `compact/YYYYMMDD-HHMMSS` records, but they do not become tape boundaries.
 
 ## Testing
