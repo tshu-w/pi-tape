@@ -2,6 +2,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import * as fs from "node:fs";
+import { getCurrentSystemPrompt, getCurrentTools } from "@earendil-works/pi-ai";
 import { anchorMessage, loadTape, makeAgentDir, textMessage } from "./harness.mjs";
 
 const agentDir = makeAgentDir();
@@ -119,6 +120,24 @@ test("a newer native compaction disables a retained anchor marker", async () => 
 	});
 
 	assert.equal(await rebuild(messages, branch), undefined);
+});
+
+test("anchor trimming preserves system state and later tool deltas", async () => {
+	const tool = (name) => ({ name, description: name, parameters: { type: "object", properties: {} } });
+	const initial = { role: "system", content: "Base instructions", sections: { cwd: "/old", notes: "Old notes" }, toolsAdded: [tool("read"), tool("write")], timestamp: 1 };
+	const beforeCut = { role: "system", content: "Additional instructions", sections: { cwd: "/remote", notes: null }, toolsRemoved: [{ name: "write" }], toolsAdded: [tool("bash")], timestamp: 2 };
+	const afterCut = { role: "system", content: "", sections: { notes: "New notes" }, toolsRemoved: [{ name: "read" }], toolsAdded: [tool("edit")], timestamp: 3 };
+	const messages = [initial, beforeCut, ...longConversation(10), anchor("state", 2000), afterCut, textMessage("user", "continue")];
+	const original = structuredClone(messages);
+	const result = await rebuild(messages);
+	assert.ok(result);
+	assert.equal(result.messages[0].role, "system");
+	assert.deepEqual(getCurrentTools(result.messages), getCurrentTools(messages));
+	assert.equal(getCurrentSystemPrompt(result.messages), getCurrentSystemPrompt(messages));
+	assert.ok(result.messages.includes(afterCut), "retained deltas keep their position");
+	assert.deepEqual(messages, original, "projection must not mutate persisted history");
+	const repeated = await rebuild(result.messages, entriesForMessages(messages));
+	assert.deepEqual(getCurrentTools(repeated?.messages ?? result.messages), getCurrentTools(messages));
 });
 
 test.after(() => fs.rmSync(agentDir, { recursive: true, force: true }));

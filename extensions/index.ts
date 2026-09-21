@@ -31,7 +31,7 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { StringEnum } from "@earendil-works/pi-ai";
+import { getCurrentSystemMessage, StringEnum } from "@earendil-works/pi-ai";
 import {
 	buildContextEntries,
 	compact,
@@ -1464,7 +1464,8 @@ export default function (pi: ExtensionAPI) {
 			preparation,
 			ctx.model,
 			auth.apiKey,
-			auth.headers,
+			// compact forwards headers unchanged; its SDK type omits supported null values.
+			auth.headers as Record<string, string> | undefined,
 			event.customInstructions,
 			event.signal,
 			pi.getThinkingLevel(),
@@ -1506,6 +1507,7 @@ export default function (pi: ExtensionAPI) {
 		const summaryMsg = makeSummaryMessage(anchor);
 		const kept = messages.slice(keepFromIdx);
 
-		return { messages: [summaryMsg, ...kept] };
+		const systemMessage = getCurrentSystemMessage(messages.slice(0, keepFromIdx));
+		return { messages: [...(systemMessage ? [systemMessage] : []), summaryMsg, ...kept] };
 	});
 }

@@ -2,7 +2,7 @@
 
 [Tape](https://tape.systems/)-style context management for [pi](https://pi.dev).
 
-Requires pi 0.81.1 or later.
+Requires pi 0.86.0 or later.
 
 ## Install
 
