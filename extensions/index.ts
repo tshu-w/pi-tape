@@ -33,7 +33,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { getCurrentSystemMessage, StringEnum } from "@earendil-works/pi-ai";
 import {
-	buildContextEntries,
+	buildSessionProjection,
 	compact,
 	findCutPoint,
 	getAgentDir,
@@ -41,6 +41,7 @@ import {
 	sessionEntryToContextMessages,
 	truncateHead,
 	type ExtensionAPI,
+	type SessionEntry,
 	type Theme,
 } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
@@ -735,16 +736,27 @@ interface ProjectedCompactionBridge {
 }
 
 function findActiveAnchorBoundary(entries: any[]): ActiveAnchorBoundary | null {
+	const projected = new Map(buildSessionProjection(entries).entries.map(({ sourceEntry, messages }) => [sourceEntry.id, messages]));
 	let active: ActiveAnchorBoundary | null = null;
 	for (const entry of entries) {
-		if (entry?.type === "compaction") {
+		if (entry.type === "compaction") {
 			active = null;
 			continue;
 		}
-		const anchor = entry?.type === "message" ? anchorFromMessage(entry.message) : null;
-		if (anchor) active = { entry, anchor };
+		for (const message of projected.get(entry.id) ?? []) {
+			const anchor = anchorFromMessage(message);
+			if (anchor) active = { entry, anchor };
+		}
 	}
 	return active;
+}
+
+function projectedContextEntries(branchEntries: SessionEntry[]): SessionEntry[] {
+	return buildSessionProjection(branchEntries).entries.flatMap<SessionEntry>(({ sourceEntry, messages }) => {
+		// Keep native compaction checkpoints atomic and ineligible as cut points.
+		if (sourceEntry.type === "compaction") return messages.length > 0 ? [sourceEntry] : [];
+		return messages.map((message) => ({ ...sourceEntry, type: "message", message }));
+	});
 }
 
 function messagesFromEntries(entries: any[], start: number, end: number): any[] {
@@ -756,7 +768,7 @@ function messagesFromEntries(entries: any[], start: number, end: number): any[] 
 }
 
 function projectedCompactionMessages(branchEntries: any[], preparation: any): any[] {
-	const contextEntries = buildContextEntries(branchEntries);
+	const contextEntries = projectedContextEntries(branchEntries);
 	const firstKeptIndex = contextEntries.findIndex((entry: any) => entry?.id === preparation.firstKeptEntryId);
 	return [
 		...preparation.messagesToSummarize,
@@ -779,7 +791,7 @@ export function prepareProjectedAnchorCompaction(
 	const active = findActiveAnchorBoundary(branchEntries);
 	if (!active) return undefined;
 
-	const contextEntries = buildContextEntries(branchEntries);
+	const contextEntries = projectedContextEntries(branchEntries);
 	const anchorIndex = contextEntries.findIndex((entry: any) => entry?.id === active.entry.id);
 	if (anchorIndex < 0) return undefined;
 
@@ -1428,8 +1440,8 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	// ── Native compaction: summarize the projected anchor context ────
-	// Core compaction prepares from the raw branch and does not run context
-	// hooks. When an anchor is the active boundary, replace that preparation
+	// Core compaction applies context edits but does not run context hooks.
+	// When an anchor is the active boundary, replace that preparation
 	// with the same projected history the model actually sees.
 	pi.on("session_before_compact", async (event, ctx) => {
 		if (!ctx.model) return;
