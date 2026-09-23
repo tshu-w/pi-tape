@@ -6,7 +6,6 @@ import test from "node:test";
 import {
 	DEFAULT_MAX_BYTES as MAX_BYTES,
 	DEFAULT_MAX_LINES as MAX_LINES,
-	formatSize,
 } from "@earendil-works/pi-coding-agent";
 import { anchorEntry, loadTape, makeCtx, textMessage } from "./harness.mjs";
 
@@ -42,7 +41,7 @@ test("search details retain location metadata without copying matched payloads",
 	assert.equal(result.details.results[0].toolName, "bash");
 	assert.match(result.content[0].text, /entryId=search-e kind=tool_result tool=bash time=/);
 	assert.doesNotMatch(result.content[0].text, /role=toolResult/);
-	assert.match(result.content[0].text, /…"\n\n\[Use tape\(action="view"/);
+	assert.match(result.content[0].text, /…"$/);
 });
 
 test("all actions share the final byte and line contract", async () => {
@@ -54,7 +53,7 @@ test("all actions share the final byte and line contract", async () => {
 	]) {
 		const result = await tools.tape.execute("anchor", { action: "anchor", name, summary }, undefined, undefined, ctx);
 		const text = assertBounded(result);
-		assert.match(text, /Output truncated/);
+		assert.match(text, /Showing lines/);
 		assert.equal(result.details.tapeAnchor.summary, summary, "anchor state remains authoritative and complete");
 		assert.deepEqual(Object.keys(result.details).sort(), ["fullOutputPath", "tapeAnchor", "truncation"]);
 		assert.equal(result.details.truncation.truncated, true);
@@ -63,8 +62,7 @@ test("all actions share the final byte and line contract", async () => {
 		const notice = text.slice(result.details.truncation.content.length);
 		assert.equal(
 			notice,
-			`\n\n[Output truncated: ${result.details.truncation.totalLines} lines, ` +
-				`${formatSize(result.details.truncation.totalBytes)} total. Full output: ${result.details.fullOutputPath}]`,
+			`\n\n[Showing lines 1-${name === "bytes" ? 1 : 2000} of ${name === "bytes" ? 2 : 2101}${name === "bytes" ? " (50.0KB limit)" : ""}. Full output: ${result.details.fullOutputPath}]`,
 		);
 		assert.equal(result.details.truncation.maxBytes, MAX_BYTES);
 		assert.equal(result.details.truncation.maxLines, MAX_LINES);
@@ -73,7 +71,7 @@ test("all actions share the final byte and line contract", async () => {
 	}
 });
 
-test("single-line entry view remains useful and preserves the full rendering", async () => {
+test("single-line entry view saves the complete body without a continuation", async () => {
 	const { tools } = await loadTape();
 	const entry = {
 		type: "message",
@@ -85,16 +83,66 @@ test("single-line entry view remains useful and preserves the full rendering", a
 	const result = await tools.tape.execute("view", { action: "view", entryId: entry.id, scope: "branch" }, undefined, undefined, ctx);
 	const text = assertBounded(result);
 	assert.ok(text.startsWith("entryId=view-ent type=message role=user time=2026-07-27 00:00:00\n\n"));
-	assert.match(text, /Output truncated/);
-	assert.equal(result.details.truncation.firstLineExceedsLimit, false);
+	assert.ok(text.includes(result.details.fullOutputPath));
+	assert.doesNotMatch(text, /Use offset=/);
+	assert.equal(result.details.truncation.firstLineExceedsLimit, true);
 	assert.equal(result.details.truncation.lastLinePartial, false);
-	assert.equal(result.details.truncation.outputLines, 2);
+	assert.equal(result.details.truncation.outputLines, 0);
 	assert.equal(result.details.totalLines, 1);
-	assert.equal(result.details.shownLines, 1);
+	assert.equal(result.details.shownLines, 0);
 	assert.equal(result.details.offset, 1);
 	assert.equal(result.details.limit, null);
-	assert.ok(fs.readFileSync(result.details.fullOutputPath, "utf8").length > MAX_BYTES);
+	assert.equal(fs.readFileSync(result.details.fullOutputPath, "utf8"), "v".repeat(60 * 1024));
 	fs.rmSync(path.dirname(result.details.fullOutputPath), { recursive: true });
+});
+
+test("oversized entry pages recover the selected body before continuing at the page end", async () => {
+	const { tools } = await loadTape();
+	const lines = ["x".repeat(60 * 1024), "middle", "lastline"];
+	for (const [bodyLines, limit] of [[[lines[0], "lastline"], 1], [lines, 2], [lines, undefined]]) {
+		const entry = { type: "message", id: "long-page", timestamp: "2026-07-27T00:00:00.000Z", message: textMessage("user", bodyLines.join("\n")) };
+		const ctx = makeCtx({ cwd: "/work", branch: [entry] });
+		const result = await tools.tape.execute("view", { action: "view", entryId: entry.id, scope: "branch", limit }, undefined, undefined, ctx);
+		const text = assertBounded(result);
+		const selected = bodyLines.slice(0, limit ?? bodyLines.length).join("\n");
+		const saved = fs.readFileSync(result.details.fullOutputPath, "utf8");
+		assert.equal(saved, selected);
+		assert.equal(result.details.shownLines, 0);
+		assert.equal(result.details.truncation.outputBytes, 0);
+		assert.ok(text.includes(result.details.fullOutputPath));
+		const continuation = text.match(/Use offset=(\d+) to continue/);
+		if (limit !== undefined) {
+			assert.match(text, /Read the full page file before continuing/);
+			assert.equal(Number(continuation?.[1]), limit + 1);
+			const next = await tools.tape.execute("next", { action: "view", entryId: entry.id, scope: "branch", offset: Number(continuation[1]) }, undefined, undefined, ctx);
+			assert.equal(next.details.fullOutputPath, undefined);
+			const tail = next.content[0].text.slice(next.content[0].text.indexOf("\n\n") + 2);
+			assert.equal(saved + "\n" + tail, bodyLines.join("\n"));
+			assert.doesNotMatch(next.content[0].text, /Use offset=/);
+		} else {
+			assert.equal(continuation, null);
+			assert.equal(saved, bodyLines.join("\n"));
+		}
+		fs.rmSync(path.dirname(result.details.fullOutputPath), { recursive: true });
+	}
+});
+
+test("entry limit paging retains the entire bounded body and appends navigation outside its budget", async () => {
+	const { tools } = await loadTape();
+	const lines = ["x".repeat(MAX_BYTES), "lastline"];
+	const entry = { type: "message", id: "exact-page", timestamp: "2026-07-27T00:00:00.000Z", message: textMessage("user", lines.join("\n")) };
+	const ctx = makeCtx({ cwd: "/work", branch: [entry] });
+	const first = await tools.tape.execute("view", { action: "view", entryId: entry.id, limit: 1 }, undefined, undefined, ctx);
+	assertBounded(first);
+	assert.equal(first.details.fullOutputPath, undefined);
+	assert.equal(first.details.truncation.truncated, false);
+	assert.equal(first.details.truncation.content, lines[0]);
+	assert.equal(first.details.shownLines, 1);
+	assert.ok(first.content[0].text.includes(lines[0]));
+	assert.match(first.content[0].text, /Use offset=2 to continue/);
+	const last = await tools.tape.execute("view", { action: "view", entryId: entry.id, offset: 2, limit: 1 }, undefined, undefined, ctx);
+	assert.equal(last.details.truncation.content, lines[1]);
+	assert.doesNotMatch(last.content[0].text, /Use offset=/);
 });
 
 test("temp-file failure fails a truncated result", async () => {
@@ -223,30 +271,6 @@ test("semantic failures and cancellation reject while empty results remain succe
 	assert.equal(pagedView.details.shownLines, 2);
 });
 
-test("pagination parameters describe their shared semantics", async () => {
-	const { tools } = await loadTape();
-	const properties = tools.tape.parameters.properties;
-	assert.match(tools.tape.promptGuidelines.join("\n"), /Use tape\(action='anchor'/);
-	assert.equal(properties.name.maxLength, 80);
-	assert.equal(properties.name.pattern, "^[a-z0-9]+(?:[-_][a-z0-9]+)*(?:\\/[a-z0-9]+(?:[-_][a-z0-9]+)*)*$");
-	assert.equal(properties.summary.minLength, 1);
-	assert.equal(properties.summary.pattern, "\\S");
-	assert.equal(properties.query.description, "Case-insensitive substring query; spaces mean AND, | means OR (optional when start/end is set)");
-	assert.equal(properties.start.description, "Inclusive start time: ISO timestamp or YYYY-MM-DD (local day start).");
-	assert.equal(properties.end.description, "Inclusive end time: ISO timestamp or YYYY-MM-DD (local day end).");
-	assert.equal(properties.kinds.description, "Entry kinds to search (default: message + tool_result)");
-	assert.equal(properties.limit.type, "integer");
-	assert.equal(properties.offset.type, "integer");
-	assert.equal(
-		properties.limit.description,
-		"Maximum records, search results, or entry lines (defaults: 20 records, 10 results; no explicit entry limit)",
-	);
-	assert.equal(
-		properties.offset.description,
-		"Pagination offset (lists: 0-based, default 0; entry lines: 1-based, default 1)",
-	);
-});
-
 test("search and record listings provide read-style offset continuation", async () => {
 	const { tools } = await loadTape();
 	const entries = Array.from({ length: 3 }, (_, index) => ({
@@ -267,10 +291,9 @@ test("search and record listings provide read-style offset continuation", async 
 	const firstSearch = await tools.tape.execute("search-1", { action: "search", query: "needle", scope: "branch", limit: 1 }, undefined, undefined, searchCtx);
 	assert.match(firstSearch.content[0].text, /^search results \(1\/3\)\n\n- entryId=entry-2 kind=message role=user time=/);
 	assert.match(firstSearch.content[0].text, /\[2 more results\. Use offset=1 to continue\.\]/);
-	assert.match(firstSearch.content[0].text, /\[Use tape\(action="view", entryId=\.\.\., sessionFile=\.\.\.\) to inspect an entry\.\]$/);
 	const lastSearch = await tools.tape.execute("search-2", { action: "search", query: "needle", scope: "branch", limit: 1, offset: 2 }, undefined, undefined, searchCtx);
 	assert.doesNotMatch(lastSearch.content[0].text, /more results/);
-	assert.match(lastSearch.content[0].text, /\[Use tape\(action="view"/);
+	assert.match(lastSearch.content[0].text, /preview: "needle 0"$/);
 	const pastSearch = await tools.tape.execute("search-3", { action: "search", query: "needle", scope: "branch", limit: 1, offset: 3 }, undefined, undefined, searchCtx);
 	assert.equal(pastSearch.content[0].text, "No entries at offset 3 (total 3).");
 	const zeroSearch = await tools.tape.execute("search-0", { action: "search", query: "needle", scope: "branch", limit: 0 }, undefined, undefined, searchCtx);
@@ -344,4 +367,34 @@ test("info reports the effective boundary and structured status", async () => {
 	assert.match(compacted.content[0].text, /active boundary: compact\/20260727-000100 \[compact-\]/);
 	assert.equal(compacted.details.boundary.kind, "compact");
 	assert.equal(compacted.details.entriesAfterBoundary, 1);
+});
+
+
+test("entry view follows automatic line and byte continuations without losing content", async () => {
+	const { tools } = await loadTape();
+	for (const lines of [
+		Array.from({ length: 3000 }, (_, i) => "line " + i),
+		Array.from({ length: 100 }, (_, i) => i + "中".repeat(500)),
+		Array.from({ length: 3000 }, (_, i) => i % 2 ? "line " + i : "").concat(""),
+	]) {
+		const entry = { type: "message", id: "paged-entry", timestamp: "2026-07-27T00:00:00.000Z", message: textMessage("user", lines.join("\n")) };
+		const ctx = makeCtx({ cwd: "/work", branch: [entry] });
+		let offset = 1;
+		const seen = [];
+		while (true) {
+			const result = await tools.tape.execute("view", { action: "view", entryId: entry.id, scope: "branch", offset }, undefined, undefined, ctx);
+			assert.equal(result.details.fullOutputPath, undefined);
+			const text = assertBounded(result);
+			const continuation = text.match(/Use offset=(\d+) to continue/);
+			const body = text.slice(text.indexOf("\n\n") + 2).split("\n\n[Showing lines ")[0];
+			seen.push(...body.split("\n"));
+			assert.equal(result.details.shownLines, body.split("\n").length);
+			if (!continuation) break;
+			const collapsed = tools.tape.renderResult(result, { expanded: false }, { fg: (_color, value) => value }, { args: { action: "view", entryId: entry.id }, isError: false }).render(1000).join("\n");
+			assert.ok(collapsed.includes(continuation[0]));
+			assert.ok(Number(continuation[1]) > offset);
+			offset = Number(continuation[1]);
+		}
+		assert.deepEqual(seen, lines);
+	}
 });

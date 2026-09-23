@@ -17,7 +17,10 @@ async function boundText(value: string): Promise<{
 	const fullOutputPath = join(directory, "output.txt");
 	await writeFile(fullOutputPath, value, "utf8");
 
-	const notice = `[Output truncated: ${full.totalLines} lines, ${formatSize(full.totalBytes)} total.` +
+	const summary = full.firstLineExceedsLimit
+		? `Line 1 is ${formatSize(Buffer.byteLength(value.split("\n")[0]!, "utf8"))}, exceeds ${formatSize(full.maxBytes)} limit.`
+		: `Showing lines 1-${full.outputLines} of ${full.totalLines}${full.truncatedBy === "bytes" ? ` (${formatSize(full.maxBytes)} limit)` : ""}.`;
+	const notice = `[${summary}` +
 		` Full output: ${fullOutputPath}]`;
 	return {
 		text: full.content ? `${full.content}\n\n${notice}` : notice,
@@ -27,6 +30,7 @@ async function boundText(value: string): Promise<{
 }
 
 async function boundResult<TDetails>(result: AgentToolResult<TDetails>): Promise<AgentToolResult<TDetails>> {
+	if ((result.details as { truncation?: TruncationResult } | undefined)?.truncation) return result;
 	const text = result.content
 		.filter((part) => part.type === "text")
 		.map((part) => part.text)

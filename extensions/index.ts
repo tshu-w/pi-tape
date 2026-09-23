@@ -34,6 +34,7 @@ import * as path from "node:path";
 import { getCurrentSystemMessage, StringEnum } from "@earendil-works/pi-ai";
 import {
 	buildSessionProjection,
+	formatSize,
 	compact,
 	findCutPoint,
 	getAgentDir,
@@ -875,16 +876,6 @@ function renderRecordRow(r: TapeRecord, currentSessionFile: string | undefined, 
 	];
 }
 
-function styleToolOutput(text: string, truncated: boolean, theme: Theme): string {
-	if (!truncated) return theme.fg("toolOutput", text);
-	const marker = "[Output truncated:";
-	const separatedFooterStart = text.lastIndexOf(`\n\n${marker}`);
-	const footerStart = separatedFooterStart >= 0 ? separatedFooterStart : text.startsWith(marker) ? 0 : -1;
-	if (footerStart < 0) return theme.fg("toolOutput", text);
-	if (footerStart === 0) return theme.fg("warning", text);
-	return `${theme.fg("toolOutput", text.slice(0, footerStart))}\n\n${theme.fg("warning", text.slice(footerStart + 2))}`;
-}
-
 function continuationNotice(unit: "records" | "results", total: number, offset: number, shown: number): string {
 	const nextOffset = offset + shown;
 	const remaining = total - nextOffset;
@@ -944,8 +935,7 @@ function renderSearchResults(results: SearchResult[], total: number, offset: num
 		return lines.join("\n");
 	});
 	return `search results (${results.length}/${total})\n\n${records.join("\n\n")}` +
-		continuationNotice("results", total, offset, results.length) +
-		'\n\n[Use tape(action="view", entryId=..., sessionFile=...) to inspect an entry.]';
+		continuationNotice("results", total, offset, results.length);
 }
 
 function messageViewText(message: any): string {
@@ -990,19 +980,34 @@ function entryViewContent(entry: any): { attributes: string[]; text: string } {
 	return { attributes: [`type=${entry?.type ?? "unknown"}`], text: JSON.stringify(entry, null, 2) };
 }
 
-function renderEntryView(entry: any, offset: number, limit?: number): { text: string; totalLines: number; shownLines: number } {
+async function renderEntryView(entry: any, offset: number, limit?: number) {
 	const view = entryViewContent(entry);
 	const lines = view.text.split("\n");
 	const start = offset - 1;
 	if (start >= lines.length) throw new Error(`Offset ${offset} is beyond end of entry (${lines.length} lines total).`);
 	const end = limit == null ? lines.length : Math.min(lines.length, start + limit);
 	const body = lines.slice(start, end).join("\n");
-	const suffix = end < lines.length ? `\n\n[Showing lines ${offset}-${end} of ${lines.length}. Use offset=${end + 1} to continue.]` : "";
 	const header = `entryId=${String(entry.id ?? "").slice(0, 8)} ${view.attributes.join(" ")} time=${formatTimestampSecond(normalizeTimestamp(entry.timestamp))}`;
+	const truncation = truncateHead(body);
+	if (truncation.firstLineExceedsLimit) {
+		const directory = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-tape-"));
+		const fullOutputPath = path.join(directory, "output.txt");
+		await fs.promises.writeFile(fullOutputPath, body, "utf8");
+		const notice = `[Line ${offset} is ${formatSize(Buffer.byteLength(lines[start]!, "utf8"))}, exceeds ${formatSize(truncation.maxBytes)} limit. Full output: ${fullOutputPath} (entry lines ${offset}-${end})]`;
+		const suffix = end < lines.length
+			? `\n\n[Read the full page file before continuing. Use offset=${end + 1} to continue.]` : "";
+		return { text: `${header}\n\n${notice}${suffix}`, totalLines: lines.length, shownLines: 0, truncation, fullOutputPath };
+	}
+	const shownLines = truncation.truncated ? truncation.outputLines : end - start;
+	const nextOffset = offset + shownLines;
+	const byteLimit = truncation.truncatedBy === "bytes" ? ` (${formatSize(truncation.maxBytes)} limit)` : "";
+	const suffix = nextOffset <= lines.length
+		? `\n\n[Showing lines ${offset}-${nextOffset - 1} of ${lines.length}${byteLimit}. Use offset=${nextOffset} to continue.]` : "";
 	return {
-		text: `${header}\n\n${body}${suffix}`,
+		text: `${header}\n\n${truncation.content}${suffix}`,
 		totalLines: lines.length,
-		shownLines: end - start,
+		shownLines,
+		truncation,
 	};
 }
 
@@ -1071,77 +1076,96 @@ export default function (pi: ExtensionAPI) {
 		},
 		renderResult(result, { expanded }, theme, context) {
 			const text = result.content.find((part) => part.type === "text")?.text ?? "";
-			const truncated = (result.details as { truncation?: { truncated?: boolean } } | undefined)?.truncation?.truncated === true;
-			const separatedFooterStart = truncated ? text.lastIndexOf("\n\n[Output truncated:") : -1;
-			const footerStart = separatedFooterStart >= 0 ? separatedFooterStart : truncated && text.startsWith("[Output truncated:") ? 0 : -1;
-			const truncationFooter = footerStart >= 0 ? text.slice(footerStart === 0 ? 0 : footerStart + 2) : undefined;
 			if (context.isError) return new Text(theme.fg("error", text), 0, 0);
-			if (expanded || footerStart === 0) return new Text(styleToolOutput(text, truncated, theme), 0, 0);
+			const details = result.details as {
+				truncation?: { truncated?: boolean; content?: string };
+				total?: number; offset?: number; shown?: number; results?: unknown[];
+			} | undefined;
+			const truncated = details?.truncation?.truncated === true;
+			const retained = details?.truncation?.content;
+			const entryView = context.args.action === "view" && context.args.entryId !== undefined;
+			let footerStart = -1;
+			if (retained !== undefined) {
+				const separator = text.indexOf("\n\n");
+				const prefix = entryView && separator >= 0 ? text.slice(0, separator + 2) : "";
+				if (text.startsWith(prefix + retained)) {
+					const end = retained === "" && prefix ? separator : prefix.length + retained.length;
+					if (end < text.length) footerStart = end;
+				} else if (text.startsWith(retained) && retained.length < text.length) {
+					footerStart = retained.length;
+				}
+			} else if (!entryView && details?.total !== undefined && details.offset !== undefined) {
+				const shown = context.args.action === "search" ? details.results?.length : details.shown;
+				if (shown !== undefined) {
+					const notice = continuationNotice(context.args.action === "search" ? "results" : "records", details.total, details.offset, shown);
+					if (notice && text.endsWith(notice)) footerStart = text.length - notice.length;
+				}
+			}
+			const footerText = footerStart >= 0 ? text.slice(footerStart).replace(/^\n\n/, "") : "";
+			const footer = footerText ? (footerStart > 0 ? "\n\n" : "") + footerText.split("\n\n")
+				.map((notice, index) => theme.fg(truncated && index === 0 ? "warning" : "dim", notice)).join("\n\n") : "";
+			const styledOutput = () => theme.fg("toolOutput", text.slice(0, footerStart >= 0 ? footerStart : text.length)) + footer;
+			if (expanded || footerStart === 0) return new Text(styledOutput(), 0, 0);
+
+			const folded = (visible: string, hidden: string, footer: string) => ({
+				render(width: number) {
+					const count = new Text(hidden, 0, 0).render(width).length;
+					const hint = theme.fg("muted", `... (${count} more lines, ${keyText("app.tools.expand")} to expand)`);
+					return new Text(`${visible}\n\n${hint}${footer}`, 0, 0).render(width);
+				},
+				invalidate() {},
+			});
 
 			if (context.args.action === "view" && context.args.entryId !== undefined) {
 				const shownLines = (result.details as { shownLines?: number } | undefined)?.shownLines;
 				const separator = text.indexOf("\n\n");
 				if (shownLines === undefined || shownLines <= COLLAPSED_TEXT_LINES || separator < 0) {
-					return new Text(styleToolOutput(text, truncated, theme), 0, 0);
+					return new Text(styledOutput(), 0, 0);
 				}
 				const header = text.slice(0, separator);
 				const bodyEnd = footerStart >= 0 ? footerStart : text.length;
-				const bodyLines = text.slice(separator + 2, bodyEnd).split("\n").slice(0, COLLAPSED_TEXT_LINES);
-				const hidden = shownLines - COLLAPSED_TEXT_LINES;
-				const hint = theme.fg(
-					"dim",
-					`... (${hidden} entry ${hidden === 1 ? "line" : "lines"} hidden, ${keyText("app.tools.expand")} to expand)`,
+				const bodyLines = text.slice(separator + 2, bodyEnd).split("\n");
+				return folded(
+					`${theme.fg("toolOutput", header)}\n\n${theme.fg("toolOutput", bodyLines.slice(0, COLLAPSED_TEXT_LINES).join("\n"))}`,
+					bodyLines.slice(COLLAPSED_TEXT_LINES).join("\n"),
+					footer,
 				);
-				const footer = truncationFooter ? `\n\n${theme.fg("warning", truncationFooter)}` : "";
-				return new Text(`${theme.fg("toolOutput", header)}\n\n${theme.fg("toolOutput", bodyLines.join("\n"))}\n\n${hint}${footer}`, 0, 0);
 			}
 
 			if (context.args.action === "anchor") {
 				const summary = (result.details as { tapeAnchor?: { summary?: string } } | undefined)?.tapeAnchor?.summary;
 				const summaryLines = summary?.split("\n");
 				if (!summaryLines || summaryLines.length <= COLLAPSED_TEXT_LINES) {
-					return new Text(styleToolOutput(text, truncated, theme), 0, 0);
+					return new Text(styledOutput(), 0, 0);
 				}
 				const header = text.split("\n", 1)[0]!;
-				const hidden = summaryLines.length - COLLAPSED_TEXT_LINES;
-				const hint = theme.fg(
-					"dim",
-					`... (${hidden} summary ${hidden === 1 ? "line" : "lines"} hidden, ${keyText("app.tools.expand")} to expand)`,
-				);
-				const footer = truncationFooter ? `\n\n${theme.fg("warning", truncationFooter)}` : "";
-				return new Text(
-					`${theme.fg("toolOutput", header)}\n${theme.fg("toolOutput", summaryLines.slice(0, COLLAPSED_TEXT_LINES).join("\n"))}\n\n${hint}${footer}`,
-					0,
-					0,
+				return folded(
+					`${theme.fg("toolOutput", header)}\n${theme.fg("toolOutput", summaryLines.slice(0, COLLAPSED_TEXT_LINES).join("\n"))}`,
+					text.slice(0, footerStart >= 0 ? footerStart : text.length).split("\n").slice(1 + COLLAPSED_TEXT_LINES).join("\n"),
+					footer,
 				);
 			}
 
 			const sections = text.split("\n\n");
 			let itemSections: string[];
-			let itemLabel: "result" | "record";
 			if (context.args.action === "search") {
 				itemSections = sections.filter((section) => section.startsWith("- entryId="));
-				itemLabel = "result";
 			} else if (context.args.action === "view" && context.args.entryId === undefined) {
 				itemSections = sections.filter((section) => /^(?:off-branch:\n)? {0,2}- name=/.test(section));
-				itemLabel = "record";
 			} else {
-				return new Text(styleToolOutput(text, truncated, theme), 0, 0);
+				return new Text(styledOutput(), 0, 0);
 			}
 
 			if (itemSections.length <= COLLAPSED_LIST_ITEMS) {
-				return new Text(styleToolOutput(text, truncated, theme), 0, 0);
+				return new Text(styledOutput(), 0, 0);
 			}
 
 			const visible = [sections[0]!, ...itemSections.slice(0, COLLAPSED_LIST_ITEMS)]
 				.map((section) => theme.fg("toolOutput", section));
-			const hidden = itemSections.length - COLLAPSED_LIST_ITEMS;
-			visible.push(theme.fg(
-				"dim",
-				`... (${hidden} ${itemLabel}${hidden === 1 ? "" : "s"} hidden, ${keyText("app.tools.expand")} to expand)`,
-			));
-			if (truncationFooter) visible.push(theme.fg("warning", truncationFooter));
-			return new Text(visible.join("\n\n"), 0, 0);
+			const lastVisible = itemSections[COLLAPSED_LIST_ITEMS - 1]!;
+			const hiddenStart = text.indexOf(lastVisible) + lastVisible.length + 2;
+			const hidden = text.slice(hiddenStart, footerStart >= 0 ? footerStart : text.length);
+			return folded(visible.join("\n\n"), hidden, footer);
 		},
 		async execute(_id, params, signal, _onUpdate, ctx) {
 			if (signal?.aborted) throw new Error("Tape operation cancelled.");
@@ -1287,7 +1311,7 @@ export default function (pi: ExtensionAPI) {
 						}
 
 						const found = candidates[0];
-						const rendered = renderEntryView(found.entry, offset, limit);
+						const rendered = await renderEntryView(found.entry, offset, limit);
 						return {
 							content: [{ type: "text", text: rendered.text }],
 							details: {
@@ -1296,6 +1320,8 @@ export default function (pi: ExtensionAPI) {
 								sessionCwd: found.cwd,
 								totalLines: rendered.totalLines,
 								shownLines: rendered.shownLines,
+								truncation: rendered.truncation,
+								...(rendered.fullOutputPath ? { fullOutputPath: rendered.fullOutputPath } : {}),
 								offset,
 								limit: limit ?? null,
 							},
