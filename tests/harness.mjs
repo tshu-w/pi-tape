@@ -26,6 +26,7 @@ export async function loadTape() {
 	factory({
 		registerTool: (tool) => { tools[tool.name] = tool; },
 		on: (event, handler) => { handlers[event] = handler; },
+		getThinkingLevel: () => "off",
 	});
 	return { tools, handlers };
 }

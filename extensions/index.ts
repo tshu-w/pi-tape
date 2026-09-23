@@ -278,7 +278,7 @@ const NOTES_USAGE = [
 function renderNotesBlock(cwd: string, recentAnchors: TapeRecord[]): string {
 	const globalNotes = readNotesFile(globalNotesPath());
 	const projectNotes = readNotesFile(projectNotesPath(cwd));
-	const lines: string[] = ["<tape-notes>", NOTES_USAGE];
+	const lines: string[] = [NOTES_USAGE];
 
 	if (globalNotes.exists) {
 		lines.push(`global (${notesStatusLabel(globalNotes)}):`, globalNotes.content);
@@ -298,7 +298,6 @@ function renderNotesBlock(cwd: string, recentAnchors: TapeRecord[]): string {
 			lines.push(`note: ${displayPath(notes.path)} truncated at ${NOTES_MAX_LINES} lines/${NOTES_MAX_BYTES} bytes — distill required`);
 		}
 	}
-	lines.push("</tape-notes>");
 
 	if (recentAnchors.length > 0) {
 		lines.push(`recent anchors (cwd, session-start snapshot): ${recentAnchors.map(anchorItemLabel).join(" · ")}`);
@@ -1462,7 +1461,7 @@ export default function (pi: ExtensionAPI) {
 			anchorSnapshot = { sessionId, recent: dedupeRecords(anchors).slice(0, RECENT_ANCHORS_LIMIT) };
 		}
 
-		return { systemPrompt: `${event.systemPrompt}\n\n${renderNotesBlock(ctx.cwd, anchorSnapshot.recent)}` };
+		event.systemPromptOptions.sections["tape-notes"] = renderNotesBlock(ctx.cwd, anchorSnapshot.recent);
 	});
 
 	// ── Native compaction: summarize the projected anchor context ────
@@ -1507,7 +1506,7 @@ export default function (pi: ExtensionAPI) {
 			event.customInstructions,
 			event.signal,
 			pi.getThinkingLevel(),
-			undefined, // ExtensionContext does not expose the active agent streamFn.
+			ctx.modelRegistry.streamSimple.bind(ctx.modelRegistry),
 			auth.env,
 		);
 		return { compaction: result };

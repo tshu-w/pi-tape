@@ -66,8 +66,9 @@ test("custom session dir scans closed sessions and always includes the external 
 	const records = await tools.tape.execute("v1", { action: "view", scope: "all" }, undefined, undefined, ctx);
 	assert.match(records.content[0].text, /live-external-anchor/);
 
-	const injected = await handlers.before_agent_start({ systemPrompt: "SYS" }, ctx);
-	assert.match(injected.systemPrompt, /recent anchors .*\[live-external-anchor\]/);
+	const event = { systemPrompt: "SYS", systemPromptOptions: { sections: {} } };
+	await handlers.before_agent_start(event, ctx);
+	assert.match(event.systemPromptOptions.sections["tape-notes"], /recent anchors .*\[live-external-anchor\]/);
 });
 
 test("cross-session search body returns a complete sessionFile usable by view for duplicated fork IDs", async () => {

@@ -24,7 +24,7 @@ pi install git:github.com/tshu-w/pi-tape
 pi-tape manages two kinds of memory:
 
 - **tape** — the immutable history (append-only log). Recalled on demand via `search`/`view`.
-- **notes** — mutable durable facts the model maintains itself (state). Injected into the system prompt every turn, right after AGENTS.md.
+- **notes** — mutable durable facts the model maintains itself (state). Injected as a dedicated system-prompt section each turn.
 
 In [tape.systems](https://tape.systems/) terms, notes are a *memory view* over the tape, materialized as a file: every note originates from a fact on the tape (user feedback, a lesson from a work segment), and the model acts as an incremental reducer that folds new facts into the view as they are confirmed — assembly cost is paid at write time instead of read time. Each fold step is itself recorded on the tape as a normal edit, so the tape remains the source of truth and the derivative never replaces the original facts.
 

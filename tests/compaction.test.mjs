@@ -165,3 +165,42 @@ test("projected compaction falls back when a native compaction is the newer boun
 
 	assert.equal(prepareProjectedAnchorCompaction(branchEntries, settings, 1000, fileOps), undefined);
 });
+
+test("projected text compaction routes through the session's registered provider", async () => {
+	const { ModelRuntime, ModelRegistry } = await import("@earendil-works/pi-coding-agent");
+	const { createAssistantMessageEventStream } = await import("@earendil-works/pi-ai");
+	const runtime = await ModelRuntime.create({ modelsPath: null, authPath: `${process.env.PI_CODING_AGENT_DIR}/auth.json`, refreshOnCreate: false });
+	const registry = new ModelRegistry(runtime);
+	let received;
+	registry.registerProvider("test-extension", {
+		api: "test-extension", apiKey: "test", baseUrl: "https://unused.test",
+		models: [{ id: "summary", name: "Summary", reasoning: false, input: ["text"], contextWindow: 200000, maxTokens: 8192, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } }],
+		streamSimple(model, context) {
+			received = context;
+			const stream = createAssistantMessageEventStream();
+			const message = {
+				role: "assistant", content: [{ type: "text", text: "Extension-provider summary." }],
+				api: model.api, provider: model.provider, model: model.id, stopReason: "stop", timestamp: Date.now(),
+				usage: { input: 10, output: 3, cacheRead: 0, cacheWrite: 0, totalTokens: 13, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+			};
+			stream.push({ type: "start", partial: message });
+			stream.push({ type: "done", reason: "stop", message });
+			stream.end();
+			return stream;
+		},
+	});
+	const { handlers } = await loadTape();
+	const branchEntries = [
+		messageEntry("old-user", textMessage("user", discarded)),
+		messageEntry("recent-user", textMessage("user", recent)),
+		messageEntry("anchor-call", { role: "assistant", content: [], timestamp: Date.now() }),
+		anchorEntry({ id: "anchor-result", name: "checkpoint", summary: "Current checkpoint.", cwd: "/x", createdAt: "2026-07-16T03:20:00.000Z", keepRecentTokens: 20 }),
+	];
+	for (let i = 0; i < branchEntries.length; i++) branchEntries[i].parentId = i > 0 ? branchEntries[i - 1].id : null;
+	const result = await handlers.session_before_compact({
+		branchEntries, preparation: { settings, tokensBefore: 1000, fileOps }, signal: new AbortController().signal,
+	}, { model: registry.find("test-extension", "summary"), modelRegistry: registry, getContextUsage: () => ({ tokens: 1234 }) });
+	assert.match(result.compaction.summary, /Extension-provider summary/);
+	assert.match(JSON.stringify(received.messages), /Current checkpoint/);
+	assert.equal(JSON.stringify(received.messages).includes(discarded), false);
+});

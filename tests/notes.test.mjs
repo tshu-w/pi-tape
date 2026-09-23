@@ -17,15 +17,19 @@ const sessionFile = path.join(agentDir, "sessions", "--fake--", "current.jsonl")
 const branch = [];
 const ctx = makeCtx({ cwd, sessionFile, branch });
 
-const inject = async () =>
-	(await handlers.before_agent_start({ type: "before_agent_start", prompt: "hi", systemPrompt: "SYS" }, ctx)).systemPrompt;
+async function inject(context = ctx, hooks = handlers) {
+	const event = { type: "before_agent_start", prompt: "hi", systemPrompt: "SYS", systemPromptOptions: { sections: { other: "Unchanged" } } };
+	assert.equal(await hooks.before_agent_start(event, context), undefined, "notes must not force a full prompt replacement");
+	assert.equal(event.systemPromptOptions.sections.other, "Unchanged");
+	return event.systemPromptOptions.sections["tape-notes"];
+}
 
 const globalNotes = path.join(agentDir, "tape", "notes.md");
 const projectNotes = path.join(agentDir, "tape", projectSlug, "notes.md");
 
 test("injection: pointers when no notes exist, anchors from past sessions", async () => {
 	const sp = await inject();
-	assert.ok(sp.startsWith("SYS\n\n<tape-notes>"));
+	assert.match(sp, /Agent-maintained cross-session notes/);
 	assert.match(sp, /global notes: none yet — create /);
 	assert.ok(sp.includes(`${projectSlug}/notes.md`));
 	assert.ok(sp.includes("recent anchors (cwd, session-start snapshot): [past-topic] 2026-07-01"));
@@ -42,7 +46,7 @@ test("record index is written and reused", async () => {
 	// Corrupt index must be survivable (rebuilt from session files).
 	fs.writeFileSync(indexFile, "not json");
 	const fresh = await loadTape();
-	const sp = (await fresh.handlers.before_agent_start({ type: "before_agent_start", prompt: "hi", systemPrompt: "SYS" }, ctx)).systemPrompt;
+	const sp = await inject(ctx, fresh.handlers);
 	assert.ok(sp.includes("[past-topic]"));
 	assert.ok(JSON.parse(fs.readFileSync(indexFile, "utf-8")).version === 1);
 });
@@ -77,13 +81,13 @@ test("snapshot stays frozen when an ephemeral session first gets a file", async 
 	const { handlers: isolatedHandlers } = await loadTape();
 	const sessionId = "new-session-id";
 	const initialCtx = makeCtx({ cwd, sessionId, sessionFile: undefined, entries: [] });
-	const initial = (await isolatedHandlers.before_agent_start({ type: "before_agent_start", prompt: "hi", systemPrompt: "SYS" }, initialCtx)).systemPrompt;
+	const initial = await inject(initialCtx, isolatedHandlers);
 
 	const allocatedFile = writeSession(agentDir, "--fake--", "allocated.jsonl", cwd, [
 		anchorEntry({ id: "allocated-anchor", name: "created-mid-session", summary: "New work.", cwd, createdAt: "2026-07-19T10:00:00.000Z" }),
 	]);
 	const allocatedCtx = makeCtx({ cwd, sessionId, sessionFile: allocatedFile, entries: [] });
-	const afterAllocation = (await isolatedHandlers.before_agent_start({ type: "before_agent_start", prompt: "hi", systemPrompt: "SYS" }, allocatedCtx)).systemPrompt;
+	const afterAllocation = await inject(allocatedCtx, isolatedHandlers);
 	assert.equal(afterAllocation, initial);
 	assert.ok(!afterAllocation.includes("created-mid-session"));
 	fs.unlinkSync(allocatedFile);
@@ -98,7 +102,7 @@ test("snapshot rescans when the session identity changes", async () => {
 	assert.ok(!sameSession.includes("later-topic"), "snapshot stays frozen within a session");
 
 	const otherCtx = makeCtx({ cwd, sessionFile: path.join(agentDir, "sessions", "--fake--", "next.jsonl") });
-	const next = (await handlers.before_agent_start({ type: "before_agent_start", prompt: "hi", systemPrompt: "SYS" }, otherCtx)).systemPrompt;
+	const next = await inject(otherCtx, handlers);
 	assert.match(next, /recent anchors \(cwd, session-start snapshot\): \[later-topic\] 2026-07-20 · \[past-topic\] 2026-07-01/);
 });
 
