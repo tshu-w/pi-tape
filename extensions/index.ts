@@ -1019,18 +1019,14 @@ export default function (pi: ExtensionAPI) {
 		name: "tape",
 		label: "Tape",
 		description: [
-			"Manage semantic context with anchors and searchable history.",
-			"anchor: create a semantic boundary with a slug and retrospective summary.",
-			"view: list anchors and compact records, or display an entry by entryId.",
-			"search: find old entries by text with optional kind and time filters.",
-			"info: show the active boundary, anchor counts, and context usage.",
+			"Manage semantic context with named anchors and retrospective summaries.",
+			"Browse anchor and compaction records, display individual entries, search history by text, kind, or time, and inspect the active boundary, anchor counts, and context usage.",
 		].join(" "),
 		promptSnippet: "Manage semantic context with anchors and searchable history",
 		promptGuidelines: [
 			"Use tape(action='anchor', name=..., summary=...) when switching topics, after a major task completes, or before continuing when context usage is high.",
-			"Use tape(action='view') to list records. To inspect a search result, pass its entryId and sessionFile when present.",
+			"Use tape(action='view', entryId=...) to inspect a search result; include its sessionFile when present.",
 			"Use tape(action='search', query=...) to recover old messages, tool results, or prior context when returning to an older topic.",
-			"Use tape(action='info') to check the active boundary and context usage.",
 			"For tape anchor summaries, prefer: Goal, Constraints & Preferences, Progress, Key Decisions, Next Steps, Critical Context.",
 		],
 		parameters: Type.Object({
@@ -1038,29 +1034,29 @@ export default function (pi: ExtensionAPI) {
 				description: "Action to perform",
 			}),
 			name: Type.Optional(Type.String({
-				description: "Anchor slug, unique per branch (required for anchor; compact/ prefix is reserved)",
+				description: "Anchor slug, unique per branch. Required for anchor; compact/ prefix is reserved.",
 				minLength: 1,
 				maxLength: ANCHOR_NAME_MAX_LENGTH,
 				pattern: ANCHOR_NAME_PATTERN.source,
 			})),
 			summary: Type.Optional(Type.String({
-				description: "Retrospective state summary (required for anchor)",
+				description: "Non-empty retrospective state summary. Required for anchor.",
 				minLength: 1,
 				pattern: "\\S",
 			})),
-			entryId: Type.Optional(Type.String({ description: "Entry ID or prefix to display (view only)" })),
-			sessionFile: Type.Optional(Type.String({ description: "Session file for entry lookup (requires entryId; usually returned by search)" })),
-			query: Type.Optional(Type.String({ description: "Case-insensitive substring query; spaces mean AND, | means OR (optional when start/end is set)" })),
-			start: Type.Optional(Type.String({ description: "Inclusive start time: ISO timestamp or YYYY-MM-DD (local day start)." })),
-			end: Type.Optional(Type.String({ description: "Inclusive end time: ISO timestamp or YYYY-MM-DD (local day end)." })),
+			entryId: Type.Optional(Type.String({ description: "Entry ID or prefix for view. Omit to list anchor and compaction records." })),
+			sessionFile: Type.Optional(Type.String({ description: "Session file for entry lookup with view. Requires entryId; usually returned by search." })),
+			query: Type.Optional(Type.String({ description: "Case-insensitive substring query for search; spaces mean AND, | means OR. Optional when start or end is set." })),
+			start: Type.Optional(Type.String({ description: "Inclusive start time for search: ISO timestamp or YYYY-MM-DD." })),
+			end: Type.Optional(Type.String({ description: "Inclusive end time for search: ISO timestamp or YYYY-MM-DD." })),
 			kinds: Type.Optional(Type.Array(StringEnum(SEARCH_KINDS), {
-				description: "Entry kinds to search (default: message + tool_result)",
+				description: "Entry kinds for search (default: message and tool_result).",
 			})),
 			scope: Type.Optional(StringEnum(["branch", "session", "cwd", "all"] as const, {
-				description: "Search/view scope (default: session)",
+				description: "Scope for search or view (default: session). branch uses the current branch; session uses the current Session; cwd uses Sessions in the current working directory; all uses all Sessions.",
 			})),
-			limit: Type.Optional(Type.Integer({ description: "Maximum records, search results, or entry lines (defaults: 20 records, 10 results; no explicit entry limit)" })),
-			offset: Type.Optional(Type.Integer({ description: "Pagination offset (lists: 0-based, default 0; entry lines: 1-based, default 1)" })),
+			limit: Type.Optional(Type.Integer({ description: "Maximum records or entry lines for view, or results for search (default: 20 records, 10 results, all entry lines)." })),
+			offset: Type.Optional(Type.Integer({ description: "Number of records or search results to skip (default: 0). When viewing an entry, the starting line number (1-based, default: 1)." })),
 		}),
 		renderCall(args, theme, context) {
 			const resultReady = !context.isPartial;
@@ -1489,7 +1485,7 @@ export default function (pi: ExtensionAPI) {
 			} catch (error) {
 				if (ctx.hasUI) {
 					const message = error instanceof Error ? error.message : String(error);
-					ctx.ui.notify(`Projected compaction adapter failed; using tape text summary. ${message}`, "warning");
+					ctx.ui.notify(`Compaction adapter failed; using text summarization. ${message}`, "warning");
 				}
 			}
 		}
