@@ -1001,7 +1001,7 @@ export default function (pi: ExtensionAPI) {
 		name: "tape",
 		label: "Tape",
 		description: [
-			"Manage semantic context with named anchors and retrospective summaries.",
+			"Manage semantic context with named anchors that mark context boundaries and carry retrospective summaries.",
 			"Browse anchor and compaction records, display individual entries, search history by text, kind, or time, and inspect the active boundary, anchor counts, and context usage.",
 		].join(" "),
 		promptSnippet: "Manage semantic context with anchors and searchable history",
