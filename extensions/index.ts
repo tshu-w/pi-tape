@@ -18,9 +18,9 @@
  * tool calls/results are excluded from search indexing to avoid echoes.
  *
  * Notes are the mutable half of the memory model: the tape is an
- * append-only log of what happened, notes files hold durable
+ * append-only log of what happened, the global notes file holds durable
  * cross-session facts the model maintains with standard file tools.
- * Notes (global + per-project) and a session-start snapshot of recent
+ * Global notes and a session-start snapshot of recent
  * cwd anchors are appended to the system prompt via before_agent_start.
  * The snapshot is frozen per session so creating an anchor never
  * changes the system prompt (and never invalidates the prompt-cache
@@ -57,9 +57,9 @@ import { withToolOutputContract } from "./tool-output.js";
 const DEFAULT_KEEP_RECENT_TOKENS = 20000;
 const ANCHOR_NAME_MAX_LENGTH = 80;
 const ANCHOR_NAME_PATTERN = /^[a-z0-9]+(?:[-_][a-z0-9]+)*(?:\/[a-z0-9]+(?:[-_][a-z0-9]+)*)*$/;
-const NOTES_BUDGET_LINES = 150;
-const NOTES_MAX_LINES = 400;
-const NOTES_MAX_BYTES = 16 * 1024;
+const NOTES_BUDGET_LINES = 40;
+const NOTES_MAX_LINES = 80;
+const NOTES_MAX_BYTES = 8 * 1024;
 const RECENT_ANCHORS_LIMIT = 10;
 const SEARCH_PREVIEW_LENGTH = 200;
 const COLLAPSED_LIST_ITEMS = 5;
@@ -231,17 +231,8 @@ interface NotesFile {
 	truncated: boolean;
 }
 
-function cwdSlug(cwd: string): string {
-	// TODO: Use collision-resistant paths when project-notes storage is redesigned.
-	return `--${cwd.replace(/^[/\\]/, "").replace(/[/\\:]/g, "-")}--`;
-}
-
 function globalNotesPath(): string {
 	return path.join(getAgentDir(), "tape", "notes.md");
-}
-
-function projectNotesPath(cwd: string): string {
-	return path.join(getAgentDir(), "tape", cwdSlug(cwd), "notes.md");
 }
 
 function displayPath(file: string): string {
@@ -268,16 +259,14 @@ function notesStatusLabel(notes: NotesFile): string {
 }
 
 const NOTES_USAGE = [
-	"Agent-maintained cross-session notes included in every system prompt. One fact per line; keep each line short; edit the files directly.",
-	'Record only: (a) user preferences and corrections — write immediately with a "(user)" prefix; (b) verified environment or external facts that would change future decisions or prevent repeated failure, and have no authoritative home elsewhere.',
-	"Never record task state — it belongs in anchors. Project results and findings belong in project docs.",
-	"Durable lessons about behavior or procedure belong in the narrowest authoritative source (AGENTS.md, a skill, or a script), not here; keep one source per rule.",
-	"Default to the global file; project file only for repo-specific facts. Defer to AGENTS.md on conflict; delete disproven or promoted entries.",
+	"Cross-session notes, loaded into every session. Edit the global file directly; keep one short entry per line.",
+	"Record general user preferences and verified facts or lessons worth retaining. Preserve their original scope; label machine- or project-specific entries.",
+	"Instructions or corrections about a particular task or project are not general preferences. Leave task progress, unverified findings, and anything of unclear scope in session history or anchors.",
+	"Update related entries instead of appending duplicates. Move established procedures to AGENTS.md, skills, or docs and remove the note; defer to AGENTS.md on conflict.",
 ].join("\n");
 
-function renderNotesBlock(cwd: string, recentAnchors: TapeRecord[]): string {
+function renderNotesBlock(recentAnchors: TapeRecord[]): string {
 	const globalNotes = readNotesFile(globalNotesPath());
-	const projectNotes = readNotesFile(projectNotesPath(cwd));
 	const lines: string[] = [NOTES_USAGE];
 
 	if (globalNotes.exists) {
@@ -285,18 +274,11 @@ function renderNotesBlock(cwd: string, recentAnchors: TapeRecord[]): string {
 	} else {
 		lines.push(`global notes: none yet — create ${displayPath(globalNotes.path)}`);
 	}
-	if (projectNotes.exists) {
-		lines.push(`project (${notesStatusLabel(projectNotes)}):`, projectNotes.content);
-	} else {
-		lines.push(`project notes: none yet — create ${displayPath(projectNotes.path)} for repo-specific facts`);
+	if (globalNotes.exists && globalNotes.lines > NOTES_BUDGET_LINES) {
+		lines.push(`note: ${displayPath(globalNotes.path)} over budget (${globalNotes.lines}/${NOTES_BUDGET_LINES} lines), consider distilling`);
 	}
-	for (const notes of [globalNotes, projectNotes]) {
-		if (notes.exists && notes.lines > NOTES_BUDGET_LINES) {
-			lines.push(`note: ${displayPath(notes.path)} over budget (${notes.lines}/${NOTES_BUDGET_LINES} lines), consider distilling`);
-		}
-		if (notes.truncated) {
-			lines.push(`note: ${displayPath(notes.path)} truncated at ${NOTES_MAX_LINES} lines/${NOTES_MAX_BYTES} bytes — distill required`);
-		}
+	if (globalNotes.truncated) {
+		lines.push(`note: ${displayPath(globalNotes.path)} truncated at ${NOTES_MAX_LINES} lines/${NOTES_MAX_BYTES} bytes — distill required`);
 	}
 
 	if (recentAnchors.length > 0) {
@@ -1440,8 +1422,8 @@ export default function (pi: ExtensionAPI) {
 	// record index so unchanged files are not re-parsed. The snapshot is
 	// deliberately frozen: anchors created mid-session are shown by the
 	// anchor tool result instead, so the system prompt — the head of the
-	// prompt-cache prefix — stays byte-identical across turns. Notes files
-	// are re-read each turn — unchanged content yields an identical prompt,
+	// prompt-cache prefix — stays byte-identical across turns. The notes file
+	// is re-read each turn — unchanged content yields an identical prompt,
 	// so prompt caching is unaffected.
 	let anchorSnapshot: { sessionId: string; recent: TapeRecord[] } | null = null;
 
@@ -1457,7 +1439,7 @@ export default function (pi: ExtensionAPI) {
 			anchorSnapshot = { sessionId, recent: dedupeRecords(anchors).slice(0, RECENT_ANCHORS_LIMIT) };
 		}
 
-		event.systemPromptOptions.sections["tape-notes"] = renderNotesBlock(ctx.cwd, anchorSnapshot.recent);
+		event.systemPromptOptions.sections["tape-notes"] = renderNotesBlock(anchorSnapshot.recent);
 	});
 
 	// ── Native compaction: summarize the projected anchor context ────

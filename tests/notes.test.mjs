@@ -7,7 +7,6 @@ import { anchorEntry, loadTape, makeAgentDir, makeCtx, writeSession } from "./ha
 
 const agentDir = makeAgentDir();
 const cwd = "/tmp/pi-tape-fake-project";
-const projectSlug = "--tmp-pi-tape-fake-project--";
 const { tools, handlers } = await loadTape();
 
 writeSession(agentDir, "--fake--", "past.jsonl", cwd, [
@@ -25,13 +24,10 @@ async function inject(context = ctx, hooks = handlers) {
 }
 
 const globalNotes = path.join(agentDir, "tape", "notes.md");
-const projectNotes = path.join(agentDir, "tape", projectSlug, "notes.md");
 
 test("injection: pointers when no notes exist, anchors from past sessions", async () => {
 	const sp = await inject();
-	assert.match(sp, /Agent-maintained cross-session notes/);
-	assert.match(sp, /global notes: none yet — create /);
-	assert.ok(sp.includes(`${projectSlug}/notes.md`));
+	assert.ok(sp.includes(globalNotes));
 	assert.ok(sp.includes("recent anchors (cwd, session-start snapshot): [past-topic] 2026-07-01"));
 });
 
@@ -48,15 +44,19 @@ test("record index is written and reused", async () => {
 	const fresh = await loadTape();
 	const sp = await inject(ctx, fresh.handlers);
 	assert.ok(sp.includes("[past-topic]"));
-	assert.ok(JSON.parse(fs.readFileSync(indexFile, "utf-8")).version === 1);
 });
 
-test("injection: notes content and line budget label", async () => {
+test("global notes follow the agent across cwd while anchor snapshots remain cwd scoped", async () => {
+	const content = "- shared preference\n- verified external fact\n";
 	fs.mkdirSync(path.dirname(globalNotes), { recursive: true });
-	fs.writeFileSync(globalNotes, "- (user) prefers incremental output\n- machine grep is aliased to rg\n");
-	const sp = await inject();
-	assert.ok(sp.includes("prefers incremental output"));
-	assert.match(sp, /global \(.*notes\.md, 2\/150 lines\):/);
+	fs.writeFileSync(globalNotes, content);
+	for (const directory of [cwd, "/tmp/pi-tape-other-project"]) {
+		const { handlers: isolatedHandlers } = await loadTape();
+		const context = makeCtx({ cwd: directory, sessionId: directory, sessionDir: path.dirname(sessionFile) });
+		const sp = await inject(context, isolatedHandlers);
+		assert.ok(sp.includes(content.trimEnd()));
+		assert.equal(sp.includes("[past-topic]"), directory === cwd);
+	}
 });
 
 test("anchor result carries the summary; system prompt snapshot stays frozen", async () => {
@@ -106,17 +106,29 @@ test("snapshot rescans when the session identity changes", async () => {
 	assert.match(next, /recent anchors \(cwd, session-start snapshot\): \[later-topic\] 2026-07-20 · \[past-topic\] 2026-07-01/);
 });
 
-test("over-budget warning", async () => {
-	fs.writeFileSync(globalNotes, Array.from({ length: 160 }, (_, i) => `- fact ${i}`).join("\n"));
-	const sp = await inject();
-	assert.ok(sp.includes("over budget (160/150 lines), consider distilling"));
+test("soft budget warns only above 40 lines without truncating", async () => {
+	for (const count of [40, 41, 60, 80]) {
+		const content = Array.from({ length: count }, (_, i) => `- fact ${i}`).join("\n");
+		fs.writeFileSync(globalNotes, content);
+		const sp = await inject();
+		assert.equal(sp.includes("over budget"), count > 40);
+		assert.ok(sp.includes(content));
+		assert.doesNotMatch(sp, /distill required/);
+	}
 });
 
-test("project notes get injected", async () => {
-	fs.mkdirSync(path.dirname(projectNotes), { recursive: true });
-	fs.writeFileSync(projectNotes, "- repo tests need bun\n");
-	const sp = await inject();
-	assert.ok(sp.includes("repo tests need bun"));
+test("hard line and byte limits bound injection without changing the global file", async () => {
+	for (const [content, lastRetained, firstOmitted] of [
+		[Array.from({ length: 81 }, (_, i) => `- bounded fact ${i}`).join("\n"), "- bounded fact 79", "- bounded fact 80"],
+		[Array.from({ length: 20 }, (_, i) => `- byte fact ${i} ${"中".repeat(500)}`).join("\n"), "- byte fact 4", "- byte fact 5"],
+	]) {
+		fs.writeFileSync(globalNotes, content);
+		const sp = await inject();
+		assert.ok(sp.includes(lastRetained));
+		assert.ok(!sp.includes(firstOmitted));
+		assert.match(sp, /distill required/);
+		assert.equal(fs.readFileSync(globalNotes, "utf8"), content);
+	}
 });
 
 test("view defaults to session while scope=cwd lists records through the index", async () => {

@@ -28,21 +28,22 @@ pi-tape manages two kinds of memory:
 
 In [tape.systems](https://tape.systems/) terms, notes are a *memory view* over the tape, materialized as a file: every note originates from a fact on the tape (user feedback, a lesson from a work segment), and the model acts as an incremental reducer that folds new facts into the view as they are confirmed — assembly cost is paid at write time instead of read time. Each fold step is itself recorded on the tape as a normal edit, so the tape remains the source of truth and the derivative never replaces the original facts.
 
-Notes live in plain markdown files that the model edits with standard file tools (no dedicated action):
+Notes live in one global markdown file that the model edits with standard file tools (no dedicated action):
 
 ```
-<agent-dir>/tape/notes.md              # global: user/machine-level facts (default)
-<agent-dir>/tape/<cwd-slug>/notes.md   # per-project, created lazily for repo-specific facts
+<agent-dir>/tape/notes.md
 ```
+
+This file is loaded across working directories. Old `<agent-dir>/tape/<cwd-slug>/notes.md` files are no longer loaded; existing files remain untouched, with no automatic migration.
 
 Conventions (enforced by prompt, not code):
 
-- One fact per bullet line; delete entries that turn out to be wrong.
-- Explicit user preferences/corrections are written immediately with a `(user)` prefix.
-- Notes are the model's empirical notebook; AGENTS.md remains the human-authored contract. On conflict, AGENTS.md wins. Promoting a note into AGENTS.md is a human action.
-- Scope: task state belongs to anchor summaries, project results to project docs, repo-derivable facts to the repo, behavior rules and procedures to AGENTS.md/skills — none of them belong in notes.
+- One short entry per line; update related entries instead of appending duplicates.
+- Record general user preferences and verified facts or lessons; label machine- or project-specific entries.
+- Instructions or corrections about a particular task or project stay in session history or anchors, as do task progress, unverified findings, and anything of unclear scope.
+- Established procedures move to AGENTS.md, skills, or docs, and the note is removed. On conflict, AGENTS.md wins.
 
-Budget: soft limit 150 lines per file (a warning is appended to the injected block); hard cap 400 lines / 16KB (content is truncated with an explicit marker — never silently).
+Budget: soft limit 40 lines (a warning is appended to the injected block); hard cap 80 lines / 8KB (content is truncated with an explicit marker — never silently).
 
 The injected block also lists recent anchor names for the current working directory (up to 10) as recall hooks into the tape. The list is a snapshot taken once per session: creating an anchor never changes the system prompt, so the prompt-cache prefix stays valid across turns. Anchors created during the session are listed in the anchor tool result instead, which survives the context rebuild.
 
