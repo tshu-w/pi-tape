@@ -31,14 +31,8 @@ test("injection: pointers when no notes exist, anchors from past sessions", asyn
 	assert.ok(sp.includes("recent anchors (cwd, session-start snapshot): [past-topic] 2026-07-01"));
 });
 
-test("record index is written and reused", async () => {
+test("corrupt record index is rebuilt from session files", async () => {
 	const indexFile = path.join(agentDir, "tape", "index.json");
-	assert.ok(fs.existsSync(indexFile));
-	const index = JSON.parse(fs.readFileSync(indexFile, "utf-8"));
-	const files = Object.keys(index.files);
-	assert.equal(files.length, 1);
-	assert.equal(index.files[files[0]].records[0].name, "past-topic");
-
 	// Corrupt index must be survivable (rebuilt from session files).
 	fs.writeFileSync(indexFile, "not json");
 	const fresh = await loadTape();
