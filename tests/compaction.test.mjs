@@ -129,14 +129,14 @@ test("threshold and overflow compaction use the active-anchor projection", async
 					},
 				},
 			};
-			await assert.rejects(
-				handlers.session_before_compact({
-					reason,
-					branchEntries,
-					preparation: { settings, tokensBefore: 1000, fileOps },
-				}, ctx),
-				/test auth stop/,
-			);
+			const warnings = [];
+			ctx.hasUI = true;
+			ctx.ui = { notify: (message) => warnings.push(message) };
+			const result = await handlers.session_before_compact({
+				reason, branchEntries, preparation: { settings, tokensBefore: 1000, fileOps },
+			}, ctx);
+			assert.deepEqual(result, { cancel: true });
+			assert.deepEqual(warnings, ["Compaction failed: test auth stop"]);
 			assert.equal(authCalls, 1);
 		});
 	}
@@ -172,6 +172,7 @@ test("projected text compaction routes through the session's registered provider
 	const runtime = await ModelRuntime.create({ modelsPath: null, authPath: `${process.env.PI_CODING_AGENT_DIR}/auth.json`, refreshOnCreate: false });
 	const registry = new ModelRegistry(runtime);
 	let received;
+	let failure;
 	registry.registerProvider("test-extension", {
 		api: "test-extension", apiKey: "test", baseUrl: "https://unused.test",
 		models: [{ id: "summary", name: "Summary", reasoning: false, input: ["text"], contextWindow: 200000, maxTokens: 8192, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } }],
@@ -184,7 +185,11 @@ test("projected text compaction routes through the session's registered provider
 				usage: { input: 10, output: 3, cacheRead: 0, cacheWrite: 0, totalTokens: 13, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
 			};
 			stream.push({ type: "start", partial: message });
-			stream.push({ type: "done", reason: "stop", message });
+			if (failure) {
+				message.stopReason = "error";
+				message.errorMessage = failure;
+				stream.push({ type: "error", reason: "error", error: message });
+			} else stream.push({ type: "done", reason: "stop", message });
 			stream.end();
 			return stream;
 		},
@@ -203,4 +208,15 @@ test("projected text compaction routes through the session's registered provider
 	assert.match(result.compaction.summary, /Extension-provider summary/);
 	assert.match(JSON.stringify(received.messages), /Current checkpoint/);
 	assert.equal(JSON.stringify(received.messages).includes(discarded), false);
+
+	for (const reason of ["threshold", "manual", "overflow"]) {
+		failure = "Claude Code quota exceeded · resets 5am (Asia/Shanghai)";
+		const warnings = [];
+		const failed = await handlers.session_before_compact({
+			reason, branchEntries, preparation: { settings, tokensBefore: 1000, fileOps }, signal: new AbortController().signal,
+		}, { model: registry.find("test-extension", "summary"), modelRegistry: registry, hasUI: true,
+			ui: { notify: (message) => warnings.push(message) } });
+		assert.deepEqual(failed, { cancel: true });
+		assert.deepEqual(warnings, [`Compaction failed: ${failure}`]);
+	}
 });

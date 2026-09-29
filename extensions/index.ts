@@ -1472,22 +1472,33 @@ export default function (pi: ExtensionAPI) {
 			}
 		}
 
-		const auth = await ctx.modelRegistry.getApiKeyAndHeaders(ctx.model);
-		if (!auth.ok) throw new Error(`Tape compaction auth failed: ${auth.error}`);
+		try {
+			const auth = await ctx.modelRegistry.getApiKeyAndHeaders(ctx.model);
+			if (!auth.ok) throw new Error(auth.error);
 
-		const result = await compact(
-			preparation,
-			ctx.model,
-			auth.apiKey,
-			// compact forwards headers unchanged; its SDK type omits supported null values.
-			auth.headers as Record<string, string> | undefined,
-			event.customInstructions,
-			event.signal,
-			pi.getThinkingLevel(),
-			ctx.modelRegistry.streamSimple.bind(ctx.modelRegistry),
-			auth.env,
-		);
-		return { compaction: result };
+			const result = await compact(
+				preparation,
+				ctx.model,
+				auth.apiKey,
+				// compact forwards headers unchanged; its SDK type omits supported null values.
+				auth.headers as Record<string, string> | undefined,
+				event.customInstructions,
+				event.signal,
+				pi.getThinkingLevel(),
+				ctx.modelRegistry.streamSimple.bind(ctx.modelRegistry),
+				auth.env,
+			);
+			return { compaction: result };
+		} catch (error) {
+			if (ctx.hasUI && !event.signal?.aborted) {
+				const message = (error instanceof Error ? error.message : String(error))
+					.replace(/^Summarization failed: /, "");
+				const reason = [...new Set(message.split("\n").map((line) => line.trim())
+					.filter((line) => line && !/^at\s/.test(line)))].join(" · ");
+				ctx.ui.notify(`Compaction failed: ${reason.slice(0, 300)}`, "warning");
+			}
+			return { cancel: true };
+		}
 	});
 
 	// ── Context hook: rebuild context from latest anchor ─────────────
