@@ -999,6 +999,7 @@ async function renderEntryView(entry: any, offset: number, limit?: number) {
 export default function (pi: ExtensionAPI) {
 	pi.registerTool(withToolOutputContract({
 		name: "tape",
+		constrainedSampling: { type: "json_schema", strict: "prefer" },
 		label: "Tape",
 		description: [
 			"Manage semantic context with named anchors that mark context boundaries and carry retrospective summaries.",
