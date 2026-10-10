@@ -3,7 +3,7 @@
 	"version": "0.1.0",
 	"description": "Tape-style context management for pi sessions.",
 	"keywords": ["pi-package", "pi-extension", "context", "tape", "anchor"],
-	"license": "MIT",
+	"license": "AGPL-3.0-only",
 	"repository": "github:tshu-w/pi-tape",
 	"type": "module",
 	"scripts": {

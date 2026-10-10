@@ -70,3 +70,7 @@ Default search kinds are `message` + `tool_result`; anchors are searchable with 
 ```bash
 npm install && npm test
 ```
+
+## License
+
+[AGPL-3.0](LICENSE)
