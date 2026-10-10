@@ -140,4 +140,11 @@ test("anchor trimming preserves system state and later tool deltas", async () =>
 	assert.deepEqual(getCurrentTools(repeated?.messages ?? result.messages), getCurrentTools(messages));
 });
 
+test("nested anchor calls are blocked; direct calls and nested reads pass", async () => {
+	const anchor = { type: "tool_call", toolName: "tape", toolCallId: "call-1", input: { action: "anchor", name: "a", summary: "s" } };
+	assert.equal((await handlers.tool_call({ ...anchor, toolCallId: "call-1/1", parentToolCallId: "call-1" }))?.block, true);
+	assert.equal(await handlers.tool_call(anchor), undefined);
+	assert.equal(await handlers.tool_call({ ...anchor, input: { action: "search", query: "q" }, parentToolCallId: "call-1" }), undefined);
+});
+
 test.after(() => fs.rmSync(agentDir, { recursive: true, force: true }));

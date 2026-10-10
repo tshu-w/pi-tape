@@ -1417,6 +1417,19 @@ export default function (pi: ExtensionAPI) {
 		},
 	}));
 
+	// ── Nested anchors: blocked ──────────────────────────────────────
+	// An anchor is stored as the tape tool result. Calls made by another tool
+	// (e.g. a codemode script) add no transcript entries, so a nested anchor
+	// would report success without ever becoming a boundary.
+	pi.on("tool_call", async (event) => {
+		if (event.toolName !== "tape" || (event.input as { action?: string }).action !== "anchor") return;
+		if (!(event as { parentToolCallId?: string }).parentToolCallId) return;
+		return {
+			block: true,
+			reason: "tape(action='anchor') must be called directly, not from another tool; a nested anchor never reaches the transcript.",
+		};
+	});
+
 	// ── Notes + recent anchors: system prompt injection ──────────────
 	// Cross-session anchors are scanned once per session (rescanned when the
 	// session identity changes, e.g. /new or resume), backed by the mtime-keyed
