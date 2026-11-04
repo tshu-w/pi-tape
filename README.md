@@ -45,7 +45,19 @@ Conventions (enforced by prompt, not code):
 
 Budget: soft limit 40 lines (a warning is appended to the injected block); hard cap 80 lines / 8KB (content is truncated with an explicit marker — never silently).
 
+When [Dream](#dream-optional) is enabled, notes are also consolidated periodically.
+
 The injected block also lists recent anchor names for the current working directory (up to 10) as recall hooks into the tape. The list is a snapshot taken once per session: creating an anchor never changes the system prompt, so the prompt-cache prefix stays valid across turns. Anchors created during the session are listed in the anchor tool result instead, which survives the context rebuild.
+
+## Dream (optional)
+
+Dream periodically consolidates notes, the global `AGENTS.md`, and global skills from your recent anchors and messages. Enable it in the global `settings.json`:
+
+```json
+"pi-tape": { "dream": { "enabled": true, "intervalDays": 3, "minAnchors": 10, "model": null } }
+```
+
+It runs in the background when a session starts, at most every `intervalDays` days and after `minAnchors` new anchors, with `model` or Pi's default model. When it ends, the session that started it shows its changes, or the next session does. Reports and `notes.md` backups are kept in `<agent-dir>/tape/dream/`; undo other changes with your version control. The prompt is [`extensions/dream.md`](extensions/dream.md).
 
 ## Recall workflow
 

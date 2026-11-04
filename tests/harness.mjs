@@ -18,17 +18,25 @@ export async function loadTapeModule() {
 	return jiti.import("../extensions/index.ts");
 }
 
+export async function loadDreamModule() {
+	return jiti.import("../extensions/dream.ts");
+}
+
 /** Load the extension with a mocked ExtensionAPI; returns registered surface. */
 export async function loadTape() {
 	const factory = (await loadTapeModule()).default;
 	const tools = {};
 	const handlers = {};
+	const appended = [];
+	const entryRenderers = {};
 	factory({
 		registerTool: (tool) => { tools[tool.name] = tool; },
 		on: (event, handler) => { handlers[event] = handler; },
 		getThinkingLevel: () => "off",
+		registerEntryRenderer: (customType, renderer) => { entryRenderers[customType] = renderer; },
+		appendEntry: (customType, data) => { appended.push({ customType, data }); },
 	});
-	return { tools, handlers };
+	return { tools, handlers, appended, entryRenderers };
 }
 
 export function makeCtx({ cwd, sessionFile, sessionDir = sessionFile ? path.dirname(sessionFile) : undefined, sessionId = sessionFile ?? "ephemeral-session", branch = [], entries = branch }) {

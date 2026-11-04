@@ -26,6 +26,10 @@
  * changes the system prompt (and never invalidates the prompt-cache
  * prefix); anchors created this session are surfaced by the anchor
  * tool result itself, which survives the context rebuild.
+ *
+ * Dream (optional, dream.ts) periodically consolidates notes, the global
+ * AGENTS.md, and global skills from recent anchors and user messages in a
+ * detached `pi -p` run.
  */
 
 import * as fs from "node:fs";
@@ -42,6 +46,7 @@ import {
 	sessionEntryToContextMessages,
 	truncateHead,
 	type ExtensionAPI,
+	type ExtensionContext,
 	type SessionEntry,
 	type Theme,
 } from "@earendil-works/pi-coding-agent";
@@ -49,6 +54,17 @@ import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { renderToolCall } from "./render-call.js";
 import { withToolOutputContract } from "./tool-output.js";
+import {
+	DREAM_ENV,
+	dreamAgentEnd,
+	dreamPromptSection,
+	dreamSessionShutdown,
+	dreamSessionStart,
+	dreamToolCall,
+	maybeStartDream,
+	registerDreamRenderer,
+	showDreamNotice,
+} from "./dream.js";
 
 // ============================================================================
 // Constants
@@ -1421,7 +1437,10 @@ export default function (pi: ExtensionAPI) {
 	// An anchor is stored as the tape tool result. Calls made by another tool
 	// (e.g. a codemode script) add no transcript entries, so a nested anchor
 	// would report success without ever becoming a boundary.
-	pi.on("tool_call", async (event) => {
+	// A dream run also restricts edits to its memory files.
+	pi.on("tool_call", async (event, ctx) => {
+		const dreamBlock = dreamToolCall(event, ctx);
+		if (dreamBlock) return dreamBlock;
 		if (event.toolName !== "tape" || (event.input as { action?: string }).action !== "anchor") return;
 		if (!(event as { parentToolCallId?: string }).parentToolCallId) return;
 		return {
@@ -1454,6 +1473,43 @@ export default function (pi: ExtensionAPI) {
 		}
 
 		event.systemPromptOptions.sections["tape-notes"] = renderNotesBlock(anchorSnapshot.recent);
+		const dream = dreamPromptSection();
+		if (dream) event.systemPromptOptions.sections["tape-dream"] = dream;
+	});
+
+	// ── Dream: periodic memory consolidation (see dream.ts) ──────────
+	registerDreamRenderer(pi);
+
+	// A run that ends while an interactive session is open is shown there
+	// once the agent is idle; otherwise the next startup shows it.
+	let noticeCtx: ExtensionContext | undefined;
+	let noticePending = false;
+	const showNotice = () => {
+		if (!noticePending || !noticeCtx?.isIdle()) return;
+		noticePending = false;
+		try {
+			showDreamNotice(pi);
+		} catch { /* a broken dream state never interrupts the session */ }
+	};
+
+	pi.on("session_start", (event, ctx) => {
+		dreamSessionStart();
+		if (ctx.mode !== "tui" || process.env[DREAM_ENV]) return;
+		noticeCtx = ctx;
+		if (event.reason !== "startup") return showNotice();
+		noticePending = true;
+		showNotice();
+		void maybeStartDream(event.reason, ctx.mode, Date.now(), () => {
+			noticePending = true;
+			showNotice();
+		}).catch(() => {});
+	});
+
+	pi.on("agent_settled", () => showNotice());
+	pi.on("agent_end", (event) => dreamAgentEnd(event.messages));
+	pi.on("session_shutdown", () => {
+		noticeCtx = undefined;
+		dreamSessionShutdown();
 	});
 
 	// ── Native compaction: summarize the projected anchor context ────
