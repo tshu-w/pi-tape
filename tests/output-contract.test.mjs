@@ -6,6 +6,7 @@ import test from "node:test";
 import {
 	DEFAULT_MAX_BYTES as MAX_BYTES,
 	DEFAULT_MAX_LINES as MAX_LINES,
+	formatSize,
 } from "@earendil-works/pi-coding-agent";
 import { anchorEntry, loadTape, makeCtx, textMessage } from "./harness.mjs";
 
@@ -48,8 +49,8 @@ test("all actions share the final byte and line contract", async () => {
 	const { tools } = await loadTape();
 	const ctx = makeCtx({ cwd: "/work" });
 	for (const [name, summary] of [
-		["bytes", "x".repeat(60 * 1024)],
-		["lines", Array.from({ length: 2100 }, (_, i) => `line ${i}`).join("\n")],
+		["bytes", "x".repeat(MAX_BYTES + 1024)],
+		["lines", Array.from({ length: MAX_LINES + 100 }, (_, i) => `line ${i}`).join("\n")],
 	]) {
 		const result = await tools.tape.execute("anchor", { action: "anchor", name, summary }, undefined, undefined, ctx);
 		const text = assertBounded(result);
@@ -62,7 +63,7 @@ test("all actions share the final byte and line contract", async () => {
 		const notice = text.slice(result.details.truncation.content.length);
 		assert.equal(
 			notice,
-			`\n\n[Showing lines 1-${name === "bytes" ? 1 : 2000} of ${name === "bytes" ? 2 : 2101}${name === "bytes" ? " (50.0KB limit)" : ""}. Full output: ${result.details.fullOutputPath}]`,
+			`\n\n[Showing lines 1-${name === "bytes" ? 1 : MAX_LINES} of ${name === "bytes" ? 2 : MAX_LINES + 101}${name === "bytes" ? ` (${formatSize(MAX_BYTES)} limit)` : ""}. Full output: ${result.details.fullOutputPath}]`,
 		);
 		assert.equal(result.details.truncation.maxBytes, MAX_BYTES);
 		assert.equal(result.details.truncation.maxLines, MAX_LINES);

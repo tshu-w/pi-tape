@@ -14,14 +14,14 @@ test("tool call renders every argument in function-call form", () => {
 	};
 	const args = { action: "search", query: "alpha beta", scope: "cwd", limit: 10 };
 	const expected = '<b>tape</b>(action="search", query="alpha beta", scope="cwd", limit=10)';
-	const pending = tools.tape.renderCall(args, theme, { expanded: false, isPartial: true });
-	assert.deepEqual(pending.render(1000).map((line) => line.trimEnd()), [expected]);
-	const completed = tools.tape.renderCall(args, theme, { expanded: false, isPartial: false });
-	assert.deepEqual(completed.render(1000).map((line) => line.trimEnd()), [expected, ""]);
-	assert.equal(styles[0][0], "toolTitle");
-	assert.ok(styles.filter(([color]) => color === "text").length > Object.keys(args).length);
-	assert.equal(styles.some(([color]) => color === "muted"), false);
-	assert.equal(styles.some(([color]) => color === "accent"), false);
+	for (const isPartial of [true, false]) {
+		styles.length = 0;
+		const component = tools.tape.renderCall(args, theme, { expanded: false, isPartial });
+		assert.deepEqual(component.render(1000).map((line) => line.trimEnd()), isPartial ? [expected] : [expected, ""]);
+		assert.equal(styles.filter(([color]) => color === "toolTitle").map(([, text]) => text).join(""), expected.slice(0, expected.indexOf("(")));
+		assert.equal(styles.filter(([color]) => color === "text").map(([, text]) => text).join(""), expected.slice(expected.indexOf("(")));
+		assert.ok(styles.every(([color]) => color === "toolTitle" || color === "text"));
+	}
 });
 
 test("search results collapse after five complete entries", () => {
@@ -173,7 +173,6 @@ test("hard truncation stays visible as a warning while navigation hints stay sub
 		{ args: { action: "anchor" }, isError: false },
 	).render(1000).map((line) => line.trimEnd()).join("\n");
 	assert.equal(noticeOnly, notice);
-	assert.doesNotMatch(noticeOnly, /omitted summary/);
 	assert.ok(styles.some(([color, text]) => color === "warning" && text === notice));
 
 	styles.length = 0;
