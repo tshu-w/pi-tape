@@ -23,7 +23,6 @@ const ENTRY_TYPE = "tape-dream";
 const DAY_MS = 24 * 60 * 60 * 1000;
 const LOCK_STALE_MS = 2 * 60 * 60 * 1000;
 const RUNS_KEPT = 10;
-const INPUT_MAX_BYTES = 200 * 1024;
 const FORWARDED_MESSAGE = /^\s*(?:<agent-[a-z-]+[\s>]|\[(?:notification|pi-agents)\])/;
 const EXTENSION_DIR = path.dirname(fileURLToPath(import.meta.url));
 const DREAM_REQUEST = "Run the tape dream now.";
@@ -253,8 +252,8 @@ function userText(entry: any): string | undefined {
 	return text.trim() && !FORWARDED_MESSAGE.test(text) ? text.trim() : undefined;
 }
 
-/** Anchor summaries and the user's own messages in (since, until], oldest first, within the byte budget. */
-export function buildDreamInput(sinceMs: number, untilMs: number): { text: string; anchors: number; messages: number; omitted: number } {
+/** Anchor summaries and the user's own messages in (since, until], oldest first, in full. */
+export function buildDreamInput(sinceMs: number, untilMs: number): { text: string; anchors: number; messages: number } {
 	const items: Array<{ time: number; block: string; anchor: boolean }> = [];
 	for (const file of sessionFilesModifiedAfter(sinceMs)) {
 		let raw: string;
@@ -274,21 +273,14 @@ export function buildDreamInput(sinceMs: number, untilMs: number): { text: strin
 	}
 	items.sort((a, b) => a.time - b.time);
 
-	let bytes = 0;
-	let start = items.length;
-	while (start > 0 && bytes + Buffer.byteLength(items[start - 1].block) <= INPUT_MAX_BYTES) {
-		bytes += Buffer.byteLength(items[--start].block);
-	}
-	const kept = items.slice(start);
-	const anchors = kept.filter((item) => item.anchor).length;
-	const messages = kept.length - anchors;
-	const omitted = start;
+	const anchors = items.filter((item) => item.anchor).length;
+	const messages = items.length - anchors;
 	const header = [
 		"# Tape dream input",
 		`Range: ${new Date(sinceMs).toISOString()} → ${new Date(untilMs).toISOString()}`,
-		`Items: ${anchors} anchors, ${messages} user messages${omitted ? `; ${omitted} oldest items omitted to fit ${INPUT_MAX_BYTES / 1024}KB` : ""}`,
+		`Items: ${anchors} anchors, ${messages} user messages`,
 	].join("\n");
-	return { text: [header, ...kept.map((item) => item.block)].join("\n\n"), anchors, messages, omitted };
+	return { text: [header, ...items.map((item) => item.block)].join("\n\n"), anchors, messages };
 }
 
 // ============================================================================

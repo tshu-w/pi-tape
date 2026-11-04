@@ -98,7 +98,7 @@ test("a dream run edits only memory files and the next startup shows its diff on
 	assert.equal(readState().lastRun.files, undefined);
 });
 
-test("dream input keeps in-range anchors and user messages and drops the oldest over budget", () => {
+test("dream input keeps in-range anchors and user messages in full", () => {
 	const since = Date.parse("2026-01-01T00:00:00Z");
 	const until = since + 1_000_000;
 	writeSession(agentDir, "--extract--", "range.jsonl", "/w", [
@@ -115,14 +115,6 @@ test("dream input keeps in-range anchors and user messages and drops the oldest 
 	assert.match(input.text, /anchor summary/);
 	assert.ok(["too old", "relay", "reply", "too new"].every((text) => !input.text.includes(text)));
 	assert.ok(input.text.includes("x".repeat(4000)));
-
-	writeSession(agentDir, "--extract--", "many.jsonl", "/w",
-		Array.from({ length: 200 }, (_, i) => entry(`m${i}`, since + 10 + i, textMessage("user", `${i} ${"y".repeat(1500)}`))));
-	const bounded = dream.buildDreamInput(since, until);
-	assert.ok(bounded.omitted > 0);
-	assert.match(bounded.text, /oldest items omitted/);
-	assert.ok(bounded.text.includes("entryId=m199 "));
-	assert.ok(!bounded.text.includes("entryId=anchor "));
 });
 
 test("a dream process that exits without a result is shown by the session that started it", async () => {
