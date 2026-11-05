@@ -977,6 +977,12 @@ function entryViewContent(entry: any): { attributes: string[]; text: string } {
 	return { attributes: [`type=${entry?.type ?? "unknown"}`], text: JSON.stringify(entry, null, 2) };
 }
 
+function entryPageNotice(offset: number, shownLines: number, totalLines: number, byteLimit = "") {
+	const nextOffset = offset + shownLines;
+	return nextOffset <= totalLines
+		? `\n\n[Showing lines ${offset}-${nextOffset - 1} of ${totalLines}${byteLimit}. Use offset=${nextOffset} to continue.]` : "";
+}
+
 async function renderEntryView(entry: any, offset: number, limit?: number) {
 	const view = entryViewContent(entry);
 	const lines = view.text.split("\n");
@@ -996,10 +1002,8 @@ async function renderEntryView(entry: any, offset: number, limit?: number) {
 		return { text: `${header}\n\n${notice}${suffix}`, totalLines: lines.length, shownLines: 0, truncation, fullOutputPath };
 	}
 	const shownLines = truncation.truncated ? truncation.outputLines : end - start;
-	const nextOffset = offset + shownLines;
 	const byteLimit = truncation.truncatedBy === "bytes" ? ` (${formatSize(truncation.maxBytes)} limit)` : "";
-	const suffix = nextOffset <= lines.length
-		? `\n\n[Showing lines ${offset}-${nextOffset - 1} of ${lines.length}${byteLimit}. Use offset=${nextOffset} to continue.]` : "";
+	const suffix = entryPageNotice(offset, shownLines, lines.length, byteLimit);
 	return {
 		text: `${header}\n\n${truncation.content}${suffix}`,
 		totalLines: lines.length,
@@ -1074,6 +1078,7 @@ export default function (pi: ExtensionAPI) {
 			const details = result.details as {
 				truncation?: { truncated?: boolean; content?: string };
 				total?: number; offset?: number; shown?: number; results?: unknown[];
+				totalLines?: number; shownLines?: number;
 			} | undefined;
 			const truncated = details?.truncation?.truncated === true;
 			const retained = details?.truncation?.content;
@@ -1088,6 +1093,9 @@ export default function (pi: ExtensionAPI) {
 				} else if (text.startsWith(retained) && retained.length < text.length) {
 					footerStart = retained.length;
 				}
+			} else if (entryView && details?.offset !== undefined && details.shownLines !== undefined && details.totalLines !== undefined) {
+				const notice = entryPageNotice(details.offset, details.shownLines, details.totalLines);
+				if (notice && text.endsWith(notice)) footerStart = text.length - notice.length;
 			} else if (!entryView && details?.total !== undefined && details.offset !== undefined) {
 				const shown = context.args.action === "search" ? details.results?.length : details.shown;
 				if (shown !== undefined) {
@@ -1314,7 +1322,7 @@ export default function (pi: ExtensionAPI) {
 								sessionCwd: found.cwd,
 								totalLines: rendered.totalLines,
 								shownLines: rendered.shownLines,
-								truncation: rendered.truncation,
+								...(rendered.truncation.truncated ? { truncation: rendered.truncation } : {}),
 								...(rendered.fullOutputPath ? { fullOutputPath: rendered.fullOutputPath } : {}),
 								offset,
 								limit: limit ?? null,
@@ -1431,6 +1439,9 @@ export default function (pi: ExtensionAPI) {
 					throw new Error(`Unknown action: ${params.action}`);
 			}
 		},
+	}, {
+		// Entry view bounds its page itself and appends navigation outside the budget.
+		selfBounded: (params) => params.action === "view" && params.entryId !== undefined,
 	}));
 
 	// ── Nested anchors: blocked ──────────────────────────────────────

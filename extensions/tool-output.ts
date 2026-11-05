@@ -3,7 +3,7 @@ import { DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, formatSize, truncateHead } from "
 import { mkdtemp, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { TSchema } from "typebox";
+import type { Static, TSchema } from "typebox";
 
 async function boundText(value: string): Promise<{
 	text: string;
@@ -29,8 +29,11 @@ async function boundText(value: string): Promise<{
 	};
 }
 
-async function boundResult<TDetails>(result: AgentToolResult<TDetails>): Promise<AgentToolResult<TDetails>> {
-	if ((result.details as { truncation?: TruncationResult } | undefined)?.truncation) return result;
+async function boundResult<TDetails>(
+	result: AgentToolResult<TDetails>,
+	options: { selfBounded?: boolean } = {},
+): Promise<AgentToolResult<TDetails>> {
+	if (options.selfBounded || (result.details as { truncation?: TruncationResult } | undefined)?.truncation) return result;
 	const text = result.content
 		.filter((part) => part.type === "text")
 		.map((part) => part.text)
@@ -55,12 +58,13 @@ async function boundResult<TDetails>(result: AgentToolResult<TDetails>): Promise
 
 export function withToolOutputContract<TParams extends TSchema, TDetails, TState>(
 	definition: ToolDefinition<TParams, TDetails, TState>,
+	options: { selfBounded?: (params: Static<TParams>) => boolean } = {},
 ): ToolDefinition<TParams, TDetails, TState> {
 	const execute = definition.execute.bind(definition);
 	return {
 		...definition,
 		async execute(id, params, signal, onUpdate, ctx) {
-			return boundResult(await execute(id, params, signal, onUpdate, ctx));
+			return boundResult(await execute(id, params, signal, onUpdate, ctx), { selfBounded: options.selfBounded?.(params) });
 		},
 	};
 }

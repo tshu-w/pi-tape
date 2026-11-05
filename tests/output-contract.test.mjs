@@ -134,15 +134,14 @@ test("entry limit paging retains the entire bounded body and appends navigation 
 	const entry = { type: "message", id: "exact-page", timestamp: "2026-07-27T00:00:00.000Z", message: textMessage("user", lines.join("\n")) };
 	const ctx = makeCtx({ cwd: "/work", branch: [entry] });
 	const first = await tools.tape.execute("view", { action: "view", entryId: entry.id, limit: 1 }, undefined, undefined, ctx);
-	assertBounded(first);
 	assert.equal(first.details.fullOutputPath, undefined);
-	assert.equal(first.details.truncation.truncated, false);
-	assert.equal(first.details.truncation.content, lines[0]);
+	assert.equal(first.details.truncation, undefined);
 	assert.equal(first.details.shownLines, 1);
 	assert.ok(first.content[0].text.includes(lines[0]));
 	assert.match(first.content[0].text, /Use offset=2 to continue/);
 	const last = await tools.tape.execute("view", { action: "view", entryId: entry.id, offset: 2, limit: 1 }, undefined, undefined, ctx);
-	assert.equal(last.details.truncation.content, lines[1]);
+	assert.equal(last.details.truncation, undefined);
+	assert.ok(last.content[0].text.endsWith(`\n\n${lines[1]}`));
 	assert.doesNotMatch(last.content[0].text, /Use offset=/);
 });
 
