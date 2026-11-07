@@ -78,6 +78,7 @@ const NOTES_MAX_LINES = 80;
 const NOTES_MAX_BYTES = 8 * 1024;
 const RECENT_ANCHORS_LIMIT = 10;
 const SEARCH_PREVIEW_LENGTH = 200;
+const TOOL_STEP_ARGS_LENGTH = 120;
 const COLLAPSED_LIST_ITEMS = 5;
 const COLLAPSED_TEXT_LINES = 15;
 const DEFAULT_SEARCH_KINDS = ["message", "tool_result"] as const;
@@ -1012,6 +1013,116 @@ async function renderEntryView(entry: any, offset: number, limit?: number) {
 	};
 }
 
+function contextMessageText(content: unknown): string {
+	if (typeof content === "string") return content;
+	if (!Array.isArray(content)) return "";
+	return content
+		.map((block: any) => {
+			if (typeof block === "string") return block;
+			if (block?.type === "text") return block.text ?? "";
+			if (block?.type === "image") return `image mimeType=${block.mimeType ?? "unknown"}`;
+			return "";
+		})
+		.filter(Boolean)
+		.join("\n\n");
+}
+
+// Conversation messages counted by `around`: user, assistant text, and custom messages.
+function isConversationEntry(entry: any): boolean {
+	if (entry?.type === "custom_message") return true;
+	if (entry?.type !== "message") return false;
+	const role = entry.message?.role;
+	return role === "user" || (role === "assistant" && !!contextMessageText(entry.message.content));
+}
+
+function isInternalToolStep(name: string, args: any): boolean {
+	return SEARCH_INTERNAL_TOOL_NAMES.has(name) && args?.action !== "anchor";
+}
+
+/**
+ * Collect entries around `entry` on its branch until `around` conversation
+ * messages are found on each side. Backwards follows parent links; forwards
+ * follows the child leading to `leafId`, otherwise the most recent child.
+ */
+function surroundingEntries(entries: any[], entry: any, around: number, leafId: string | undefined): { before: any[]; after: any[] } {
+	const byId = new Map(entries.map((e) => [e.id, e]));
+	const children = new Map<string, any[]>();
+	for (const e of entries) {
+		if (e.parentId) children.set(e.parentId, [...(children.get(e.parentId) ?? []), e]);
+	}
+	const leafPath = new Set<string>();
+	for (let cur = byId.get(leafId); cur; cur = byId.get(cur.parentId)) leafPath.add(cur.id);
+
+	const before: any[] = [];
+	let count = 0;
+	for (let cur = byId.get(entry.parentId); cur && count < around; cur = byId.get(cur.parentId)) {
+		before.unshift(cur);
+		if (isConversationEntry(cur)) count++;
+	}
+	const after: any[] = [];
+	count = 0;
+	for (let kids = children.get(entry.id); kids && count < around; kids = children.get(after.at(-1).id)) {
+		const next = kids.find((kid) => leafPath.has(kid.id)) ?? kids.at(-1);
+		after.push(next);
+		if (isConversationEntry(next)) count++;
+	}
+	return { before, after };
+}
+
+/** Render conversation messages in full and fold each tool step into one line. */
+function renderSurroundingEntries(range: any[], entries: any[]): { text: string; messages: number } {
+	const calls = new Map<string, any>();
+	const results = new Map<string, any>();
+	for (const e of entries) {
+		const message = e?.type === "message" ? e.message : undefined;
+		if (message?.role === "toolResult") results.set(message.toolCallId, message);
+		if (message?.role === "assistant" && Array.isArray(message.content)) {
+			for (const block of message.content) if (block?.type === "toolCall") calls.set(block.id, block);
+		}
+	}
+	const stepLine = (name: string, args: unknown, result: any) => {
+		const argsText = Array.from(JSON.stringify(args ?? {}));
+		const shortArgs = argsText.length > TOOL_STEP_ARGS_LENGTH ? `${argsText.slice(0, TOOL_STEP_ARGS_LENGTH).join("")}…` : argsText.join("");
+		return `- tool=${name} args=${shortArgs} status=${!result ? "no result" : result.isError ? "error" : "ok"}`;
+	};
+
+	const blocks: string[] = [];
+	const shownCalls = new Set<string>();
+	let messages = 0;
+	let lastWasStep = false;
+	const push = (text: string, step: boolean) => {
+		if (step && lastWasStep) blocks[blocks.length - 1] += `\n${text}`;
+		else blocks.push(text);
+		lastWasStep = step;
+	};
+	for (const e of range) {
+		const message = e?.type === "message" ? e.message : undefined;
+		if (message?.role === "toolResult") {
+			const call = calls.get(message.toolCallId);
+			if (shownCalls.has(message.toolCallId) || isInternalToolStep(message.toolName, call?.arguments)) continue;
+			push(stepLine(message.toolName, call?.arguments, message), true);
+			continue;
+		}
+		if (isConversationEntry(e)) {
+			const header = `entryId=${String(e.id ?? "").slice(0, 8)} ${entryViewContent(e).attributes.join(" ")} time=${formatTimestampSecond(normalizeTimestamp(e.timestamp))}`;
+			push(`${header}\n${contextMessageText(message ? message.content : e.content)}`, false);
+			messages++;
+		}
+		if (message?.role === "assistant" && Array.isArray(message.content)) {
+			for (const block of message.content) {
+				if (block?.type !== "toolCall" || isInternalToolStep(block.name, block.arguments)) continue;
+				shownCalls.add(block.id);
+				push(stepLine(block.name, block.arguments, results.get(block.id)), true);
+			}
+		}
+	}
+	return { text: blocks.join("\n\n"), messages };
+}
+
+function messageCountLabel(count: number): string {
+	return `${count} message${count === 1 ? "" : "s"}`;
+}
+
 // ============================================================================
 // Extension
 // ============================================================================
@@ -1060,6 +1171,10 @@ export default function (pi: ExtensionAPI) {
 			})),
 			limit: Type.Optional(Type.Integer({ description: "Maximum records or entry lines for view, or results for search (default: 20 records, 10 results, all entry lines)." })),
 			offset: Type.Optional(Type.Integer({ description: "Number of records or search results to skip (default: 0). When viewing an entry, the starting line number (1-based, default: 1)." })),
+			around: Type.Optional(Type.Integer({
+				description: "Messages to show on each side of entryId when viewing an entry; tool steps between them are folded (default: 0).",
+				minimum: 0,
+			})),
 		}),
 		renderCall(args, theme, context) {
 			const resultReady = !context.isPartial;
@@ -1117,6 +1232,16 @@ export default function (pi: ExtensionAPI) {
 				},
 				invalidate() {},
 			});
+
+			if (entryView && context.args.around) {
+				const bodyLines = text.slice(0, footerStart >= 0 ? footerStart : text.length).split("\n");
+				if (bodyLines.length <= COLLAPSED_TEXT_LINES) return new Text(styledOutput(), 0, 0);
+				return folded(
+					theme.fg("toolOutput", bodyLines.slice(0, COLLAPSED_TEXT_LINES).join("\n")),
+					bodyLines.slice(COLLAPSED_TEXT_LINES).join("\n"),
+					footer,
+				);
+			}
 
 			if (context.args.action === "view" && context.args.entryId !== undefined) {
 				const shownLines = (result.details as { shownLines?: number } | undefined)?.shownLines;
@@ -1269,15 +1394,19 @@ export default function (pi: ExtensionAPI) {
 					if (params.sessionFile !== undefined && params.entryId === undefined) {
 						throw new Error("`sessionFile` requires `entryId`.");
 					}
+					if (params.around !== undefined && params.entryId === undefined) {
+						throw new Error("`around` requires `entryId`.");
+					}
 
 					if (params.entryId !== undefined) {
 						const entryId = params.entryId;
 						const limit = params.limit === undefined ? undefined : Math.max(1, Math.trunc(params.limit));
 						const offset = Math.max(1, Math.trunc(params.offset ?? 1));
-						const candidates: Array<{ entry: any; file?: string; cwd?: string }> = [];
+						const around = Math.max(0, Math.trunc(params.around ?? 0));
+						const candidates: Array<{ entry: any; entries: any[]; file?: string; cwd?: string }> = [];
 						const addMatches = (entries: any[], file?: string, cwd?: string) => {
 							for (const entry of entries) {
-								if (typeof entry?.id === "string" && entry.id.startsWith(entryId)) candidates.push({ entry, file, cwd });
+								if (typeof entry?.id === "string" && entry.id.startsWith(entryId)) candidates.push({ entry, entries, file, cwd });
 							}
 						};
 
@@ -1314,18 +1443,36 @@ export default function (pi: ExtensionAPI) {
 
 						const found = candidates[0];
 						const rendered = await renderEntryView(found.entry, offset, limit);
+						let text = rendered.text;
+						if (around > 0) {
+							const current = found.entries === sessionEntries || found.entries === branchEntries;
+							const leafId = current ? branchEntries.at(-1)?.id : found.entries.at(-1)?.id;
+							const range = surroundingEntries(found.entries, found.entry, around, leafId);
+							const before = renderSurroundingEntries(range.before, found.entries);
+							const after = renderSurroundingEntries(range.after, found.entries);
+							text = [
+								`[before: ${messageCountLabel(before.messages)}]`,
+								...(before.text ? [before.text] : []),
+								"[entry]",
+								rendered.text,
+								`[after: ${messageCountLabel(after.messages)}]`,
+								...(after.text ? [after.text] : []),
+							].join("\n\n");
+						}
 						return {
-							content: [{ type: "text", text: rendered.text }],
+							content: [{ type: "text", text }],
 							details: {
 								entryId: found.entry.id,
 								sessionFile: found.file,
 								sessionCwd: found.cwd,
 								totalLines: rendered.totalLines,
 								shownLines: rendered.shownLines,
-								...(rendered.truncation.truncated ? { truncation: rendered.truncation } : {}),
+								// With around, the output contract bounds the combined text.
+								...(rendered.truncation.truncated && around === 0 ? { truncation: rendered.truncation } : {}),
 								...(rendered.fullOutputPath ? { fullOutputPath: rendered.fullOutputPath } : {}),
 								offset,
 								limit: limit ?? null,
+								around,
 							},
 						};
 					}
@@ -1440,8 +1587,9 @@ export default function (pi: ExtensionAPI) {
 			}
 		},
 	}, {
-		// Entry view bounds its page itself and appends navigation outside the budget.
-		selfBounded: (params) => params.action === "view" && params.entryId !== undefined,
+		// Entry view bounds its page itself and appends navigation outside the budget;
+		// with around, the contract bounds the combined output.
+		selfBounded: (params) => params.action === "view" && params.entryId !== undefined && !params.around,
 	}));
 
 	// ── Nested anchors: blocked ──────────────────────────────────────
