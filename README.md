@@ -4,7 +4,7 @@ Context and memory for [Pi](https://pi.dev), built on the session [tape](https:/
 
 - **Anchors**: The model marks a topic boundary with a summary; from then on it sees the summary and recent messages, and older history stays searchable.
 - **Recall**: The model searches earlier messages and tool results across sessions and reads any entry with the messages around it.
-- **Memory**: The model keeps what future sessions need, such as your preferences, lasting project facts, and where things live. Its index loads into every session and details load on demand; `AGENTS.md` and skills stay yours.
+- **Memory**: The model keeps what future sessions need, such as your preferences, lasting project facts, and where things live. Its index loads into every session and details load on demand.
 - **Dream** (optional): Memory is consolidated in the background: duplicates merged, dated memories re-checked against later sessions, stale ones removed.
 
 ## Install
@@ -23,7 +23,7 @@ Enable it in the global `settings.json`:
 "pi-tape": { "dream": { "enabled": true, "minHours": 24, "minMessages": 30, "model": null } }
 ```
 
-It runs at most every `minHours` hours, once you have sent `minMessages` messages since the last run. It edits only `<agent-dir>/tape/memory/` and suggests changes to `AGENTS.md` and skills in its report; reports and backups are kept in `<agent-dir>/tape/dream/`. The prompt is [`extensions/dream.md`](extensions/dream.md).
+It runs at most every `minHours` hours, once you have sent `minMessages` messages since the last run, and suggests changes to `AGENTS.md` and skills in its report. Reports and backups are kept in `<agent-dir>/tape/dream/`. The prompt is [`extensions/dream.md`](extensions/dream.md).
 
 ## Limitations
 

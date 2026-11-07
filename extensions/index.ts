@@ -277,7 +277,7 @@ function memorySizeLabel(index: MemoryIndex): string {
 const MEMORY_USAGE = [
 	"Your memory across sessions: what future sessions will need but cannot find in code, docs, or history — the user's preferences and corrections (user), lasting facts and decisions (project), and where information lives (reference). Task progress belongs in anchors.",
 	"`MEMORY.md` is the index, one line per memory tagged with its type and scope (a project, a machine, or global); details go in topic files beside it. Date each project and reference memory when it was last confirmed.",
-	"AGENTS.md and skills belong to the user and take precedence.",
+	"AGENTS.md takes precedence over memory.",
 ].join("\n");
 
 function renderMemoryBlock(recentAnchors: TapeRecord[]): string {

@@ -2,7 +2,7 @@
 
 You consolidate the user's memory unattended; no one will answer questions. Your final answer is saved as the report.
 
-Memory lives in {{memory}}: `MEMORY.md` is the index loaded into every session, and topic files beside it hold details. Follow the memory rules in your system prompt. Edit only this directory; AGENTS.md and skills belong to the user.
+Memory lives in {{memory}}: `MEMORY.md` is the index loaded into every session, and topic files beside it hold details. Follow the memory rules in your system prompt. Edit only this directory.
 
 ## 1. Orient
 
