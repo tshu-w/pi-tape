@@ -10,44 +10,44 @@ Requires pi 0.87.0 or later.
 pi install git:github.com/tshu-w/pi-tape
 ```
 
-## Tools
+## Concepts
 
-| Action | Description |
-|---|---|
-| `anchor` | Create a semantic boundary with a slug and retrospective summary |
-| `view` | List anchors and compact records, or display an entry by `entryId` |
-| `search` | Find old entries by query, kind, and timestamp filters |
-| `info` | Show the active boundary, anchor counts, and context usage |
+pi-tape keeps two kinds of memory:
+
+- **Tape** — the append-only session history. The model recalls it on demand.
+- **Notes** — durable facts the model maintains itself, loaded into every session.
+
+In [tape.systems](https://tape.systems/) terms, notes are a memory view over the tape: each note folds in facts confirmed on the tape, and every edit is itself recorded there, so the tape stays the source of truth.
+
+### Anchors
+
+An anchor marks a topic boundary and carries a summary of the work so far. The model creates one when switching topics, after finishing a major task, or when context runs high. From then on, the model sees the anchor's summary followed by the most recent messages instead of the full history; older messages remain on the tape and can still be recalled.
+
+### Recall
+
+The model searches the tape for earlier messages and tool results, then opens a matching entry to read it in full. Search can span the current branch, the session, sessions in the same working directory, or all sessions. Tape's own searches and views are left out of search results, so earlier lookups do not echo back.
+
+The tool also lists anchors and compaction records, and reports the active boundary, anchor counts, and context usage.
+
+### Compaction
+
+Native compaction and anchors coexist; whichever boundary is later takes effect. While an anchor is active, compaction (manual or automatic) summarizes what the model actually sees rather than the raw history. Other custom compaction handlers are unsupported while an anchor is active. Compaction summaries appear among the tape's records as `compact/YYYYMMDD-HHMMSS`, but they do not become anchors.
 
 ## Notes
 
-pi-tape manages two kinds of memory:
-
-- **tape** — the immutable history (append-only log). Recalled on demand via `search`/`view`.
-- **notes** — mutable durable facts the model maintains itself (state). Injected as a dedicated system-prompt section each turn.
-
-In [tape.systems](https://tape.systems/) terms, notes are a *memory view* over the tape, materialized as a file: every note originates from a fact on the tape (user feedback, a lesson from a work segment), and the model acts as an incremental reducer that folds new facts into the view as they are confirmed — assembly cost is paid at write time instead of read time. Each fold step is itself recorded on the tape as a normal edit, so the tape remains the source of truth and the derivative never replaces the original facts.
-
-Notes live in one global markdown file that the model edits with standard file tools (no dedicated action):
+Notes live in one global file, edited by the model with ordinary file tools:
 
 ```
 <agent-dir>/tape/notes.md
 ```
 
-This file is loaded across working directories. Old `<agent-dir>/tape/<cwd-slug>/notes.md` files are no longer loaded; existing files remain untouched, with no automatic migration.
+The file is shared across working directories. Older per-directory files (`<agent-dir>/tape/<cwd-slug>/notes.md`) are no longer loaded and are not migrated.
 
-Conventions (enforced by prompt, not code):
+Notes hold short, general preferences and verified lessons; task progress and project-specific instructions stay in history or anchors, and established procedures move to `AGENTS.md` or skills. These conventions are set by the prompt, not enforced by code.
 
-- One short entry per line; update related entries instead of appending duplicates.
-- Record general user preferences and verified facts or lessons; label machine- or project-specific entries.
-- Instructions or corrections about a particular task or project stay in session history or anchors, as do task progress, unverified findings, and anything of unclear scope.
-- Established procedures move to AGENTS.md, skills, or docs, and the note is removed. On conflict, AGENTS.md wins.
+Size limits: past 40 lines the model is asked to distill; past 80 lines or 8KB the loaded content is cut off, with an explicit marker.
 
-Budget: soft limit 40 lines (a warning is appended to the injected block); hard cap 80 lines / 8KB (content is truncated with an explicit marker — never silently).
-
-When [Dream](#dream-optional) is enabled, notes are also consolidated periodically.
-
-The injected block also lists recent anchor names for the current working directory (up to 10) as recall hooks into the tape. The list is a snapshot taken once per session: creating an anchor never changes the system prompt, so the prompt-cache prefix stays valid across turns. Anchors created during the session are listed in the anchor tool result instead, which survives the context rebuild.
+Alongside the notes, the system prompt lists up to 10 recent anchors from the current working directory. The list is taken once per session so the prompt stays cache-friendly; anchors created during the session appear in the anchor tool's result instead.
 
 ## Dream (optional)
 
@@ -58,24 +58,6 @@ Dream periodically consolidates notes, the global `AGENTS.md`, and global skills
 ```
 
 It runs in the background when a session starts, at most every `intervalDays` days and after `minAnchors` new anchors, with `model` or Pi's default model. When it ends, the session that started it shows its changes, or the next session does. Reports and `notes.md` backups are kept in `<agent-dir>/tape/dream/`; undo other changes with your version control. The prompt is [`extensions/dream.md`](extensions/dream.md).
-
-## Recall workflow
-
-Recall follows the grep → read pattern:
-
-1. `search(query=...)` returns bounded previews with entry IDs. Space means AND, `|` means OR. Optional `kinds` and `start`/`end` filters narrow results.
-2. `view(entryId=...)` displays the full entry content with line pagination (`offset`/`limit`).
-
-For cross-session recall, search with `scope="cwd"` or `"all"`, then pass the returned `sessionFile` to `view`.
-
-Default search kinds are `message` + `tool_result`; anchors are searchable with `kinds=["anchor"]`. Tape's own tool calls/results are excluded from search indexing to avoid echoing previous searches.
-
-## Implementation notes
-
-- Context is rebuilt from the latest anchor: summary is injected as conversation history, followed by a window of messages kept via pi's compact cut points.
-- Native compaction and anchors coexist; the later boundary wins. Manual, threshold, and overflow compaction summarize the effective anchor-projected context, not the raw branch.
-- Native compaction and compatible provider adapters consume the same projected Anchor context, including the request and tool work before a mid-turn cut. Other custom compaction handlers are unsupported while an anchor is active.
-- Compact summaries appear in `view` and `search` as `compact/YYYYMMDD-HHMMSS` records, but they do not become tape boundaries.
 
 ## Testing
 
