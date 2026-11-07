@@ -17,19 +17,18 @@
  * content is read via view(entryId) with line pagination. Tape's own
  * tool calls/results are excluded from search indexing to avoid echoes.
  *
- * Notes are the mutable half of the memory model: the tape is an
- * append-only log of what happened, the global notes file holds durable
- * cross-session facts the model maintains with standard file tools.
- * Global notes and a session-start snapshot of recent
+ * Memory is the mutable half of the memory model: the tape is an
+ * append-only log of what happened, the global memory directory holds
+ * what future sessions need, maintained by the model with standard file
+ * tools. The memory index and a session-start snapshot of recent
  * cwd anchors are appended to the system prompt via before_agent_start.
  * The snapshot is frozen per session so creating an anchor never
  * changes the system prompt (and never invalidates the prompt-cache
  * prefix); anchors created this session are surfaced by the anchor
  * tool result itself, which survives the context rebuild.
  *
- * Dream (optional, dream.ts) periodically consolidates notes, the global
- * AGENTS.md, and global skills from recent anchors and user messages in a
- * detached `pi -p` run.
+ * Dream (optional, dream.ts) periodically consolidates the memory directory
+ * from recent anchors and user messages in a detached `pi -p` run.
  */
 
 import * as fs from "node:fs";
@@ -73,9 +72,9 @@ import {
 const DEFAULT_KEEP_RECENT_TOKENS = 20000;
 const ANCHOR_NAME_MAX_LENGTH = 80;
 const ANCHOR_NAME_PATTERN = /^[a-z0-9]+(?:[-_][a-z0-9]+)*(?:\/[a-z0-9]+(?:[-_][a-z0-9]+)*)*$/;
-const NOTES_BUDGET_LINES = 40;
-const NOTES_MAX_LINES = 80;
-const NOTES_MAX_BYTES = 8 * 1024;
+const MEMORY_MAX_LINES = 100;
+const MEMORY_MAX_BYTES = 10 * 1024;
+const MEMORY_NEAR_CAP = 0.9;
 const RECENT_ANCHORS_LIMIT = 10;
 const SEARCH_PREVIEW_LENGTH = 200;
 const TOOL_STEP_ARGS_LENGTH = 120;
@@ -237,19 +236,20 @@ function sessionEntriesForScan(item: { file: string }, sessionFile: string | und
 }
 
 // ============================================================================
-// Notes files (durable cross-session state)
+// Memory index (durable cross-session state)
 // ============================================================================
 
-interface NotesFile {
+interface MemoryIndex {
 	path: string;
 	exists: boolean;
 	content: string;
 	lines: number;
+	bytes: number;
 	truncated: boolean;
 }
 
-function globalNotesPath(): string {
-	return path.join(getAgentDir(), "tape", "notes.md");
+function memoryIndexPath(): string {
+	return path.join(getAgentDir(), "tape", "memory", "MEMORY.md");
 }
 
 function displayPath(file: string): string {
@@ -257,51 +257,62 @@ function displayPath(file: string): string {
 	return file.startsWith(home) ? `~${file.slice(home.length)}` : file;
 }
 
-function readNotesFile(file: string): NotesFile {
+function readMemoryIndex(file: string): MemoryIndex {
 	let raw: string;
 	try {
 		raw = fs.readFileSync(file, "utf-8");
 	} catch {
-		return { path: file, exists: false, content: "", lines: 0, truncated: false };
+		return { path: file, exists: false, content: "", lines: 0, bytes: 0, truncated: false };
 	}
 	const trimmed = raw.trimEnd();
 	const lines = trimmed ? trimmed.split("\n").length : 0;
-	const truncation = truncateHead(trimmed, { maxLines: NOTES_MAX_LINES, maxBytes: NOTES_MAX_BYTES });
-	return { path: file, exists: true, content: truncation.content, lines, truncated: truncation.truncated };
+	const truncation = truncateHead(trimmed, { maxLines: MEMORY_MAX_LINES, maxBytes: MEMORY_MAX_BYTES });
+	return { path: file, exists: true, content: truncation.content, lines, bytes: Buffer.byteLength(trimmed), truncated: truncation.truncated };
 }
 
-function notesStatusLabel(notes: NotesFile): string {
-	const over = notes.lines > NOTES_BUDGET_LINES ? ", over budget" : "";
-	return `${displayPath(notes.path)}, ${notes.lines}/${NOTES_BUDGET_LINES} lines${over}`;
+function memorySizeLabel(index: MemoryIndex): string {
+	return `${index.lines}/${MEMORY_MAX_LINES} lines, ${formatSize(index.bytes)}/${formatSize(MEMORY_MAX_BYTES)}`;
 }
 
-const NOTES_USAGE = [
-	"Cross-session notes, loaded into every session. Edit the global file directly; keep one short entry per line.",
-	"Record general user preferences and verified facts or lessons worth retaining. Preserve their original scope; label machine- or project-specific entries.",
-	"Instructions or corrections about a particular task or project are not general preferences. Leave task progress, unverified findings, and anything of unclear scope in session history or anchors.",
-	"Update related entries instead of appending duplicates. Move established procedures to AGENTS.md, skills, or docs and remove the note; defer to AGENTS.md on conflict.",
+const MEMORY_USAGE = [
+	"Your memory across sessions: what future sessions will need but cannot find in code, docs, or history — the user's preferences and corrections (user), lasting facts and decisions (project), and where information lives (reference). Task progress belongs in anchors.",
+	"`MEMORY.md` is the index, one line per memory tagged with its type and scope (a project, a machine, or global); details go in topic files beside it. Date each project and reference memory when it was last confirmed.",
+	"AGENTS.md and skills belong to the user and take precedence.",
 ].join("\n");
 
-function renderNotesBlock(recentAnchors: TapeRecord[]): string {
-	const globalNotes = readNotesFile(globalNotesPath());
-	const lines: string[] = [NOTES_USAGE];
+function renderMemoryBlock(recentAnchors: TapeRecord[]): string {
+	const index = readMemoryIndex(memoryIndexPath());
+	const lines: string[] = [MEMORY_USAGE];
 
-	if (globalNotes.exists) {
-		lines.push(`global (${notesStatusLabel(globalNotes)}):`, globalNotes.content);
+	if (index.exists) {
+		lines.push(`memory (${displayPath(index.path)}, ${memorySizeLabel(index)}):`, index.content);
 	} else {
-		lines.push(`global notes: none yet — create ${displayPath(globalNotes.path)}`);
+		lines.push(`memory: none yet — create ${displayPath(index.path)}`);
 	}
-	if (globalNotes.exists && globalNotes.lines > NOTES_BUDGET_LINES) {
-		lines.push(`note: ${displayPath(globalNotes.path)} over budget (${globalNotes.lines}/${NOTES_BUDGET_LINES} lines), consider distilling`);
-	}
-	if (globalNotes.truncated) {
-		lines.push(`note: ${displayPath(globalNotes.path)} truncated at ${NOTES_MAX_LINES} lines/${NOTES_MAX_BYTES} bytes — distill required`);
+	if (index.truncated) {
+		lines.push(`MEMORY.md is cut at ${MEMORY_MAX_LINES} lines/${formatSize(MEMORY_MAX_BYTES)}; the rest is not loaded. Move details to topic files.`);
 	}
 
 	if (recentAnchors.length > 0) {
 		lines.push(`recent anchors (cwd, session-start snapshot): ${recentAnchors.map(anchorItemLabel).join(" · ")}`);
 	}
 	return lines.join("\n");
+}
+
+/** Appended to a write or edit result that leaves MEMORY.md near its cap. */
+function memoryNearCapNotice(file: string): string | undefined {
+	if (path.basename(file) !== "MEMORY.md" || realDir(path.dirname(file)) !== realDir(path.dirname(memoryIndexPath()))) return undefined;
+	const index = readMemoryIndex(memoryIndexPath());
+	if (index.lines < MEMORY_MAX_LINES * MEMORY_NEAR_CAP && index.bytes < MEMORY_MAX_BYTES * MEMORY_NEAR_CAP) return undefined;
+	return `MEMORY.md is at ${memorySizeLabel(index)}; lines past the cap are not loaded. Tidy the index: move details to topic files.`;
+}
+
+function realDir(dir: string): string {
+	try {
+		return fs.realpathSync.native(dir);
+	} catch {
+		return dir;
+	}
 }
 
 function anchorItemLabel(r: TapeRecord): string {
@@ -1608,13 +1619,21 @@ export default function (pi: ExtensionAPI) {
 		};
 	});
 
-	// ── Notes + recent anchors: system prompt injection ──────────────
+	// ── Memory index near its cap: ask for a tidy-up ─────────────────
+	pi.on("tool_result", async (event, ctx) => {
+		if (event.isError || (event.toolName !== "write" && event.toolName !== "edit")) return;
+		const file = path.resolve(ctx.cwd, String(event.input?.path ?? "").replace(/^~(?=$|\/)/, os.homedir()));
+		const notice = memoryNearCapNotice(file);
+		if (notice) return { content: [...event.content, { type: "text", text: notice }] };
+	});
+
+	// ── Memory + recent anchors: system prompt injection ─────────────
 	// Cross-session anchors are scanned once per session (rescanned when the
 	// session identity changes, e.g. /new or resume), backed by the mtime-keyed
 	// record index so unchanged files are not re-parsed. The snapshot is
 	// deliberately frozen: anchors created mid-session are shown by the
 	// anchor tool result instead, so the system prompt — the head of the
-	// prompt-cache prefix — stays byte-identical across turns. The notes file
+	// prompt-cache prefix — stays byte-identical across turns. The memory index
 	// is re-read each turn — unchanged content yields an identical prompt,
 	// so prompt caching is unaffected.
 	let anchorSnapshot: { sessionId: string; recent: TapeRecord[] } | null = null;
@@ -1631,7 +1650,7 @@ export default function (pi: ExtensionAPI) {
 			anchorSnapshot = { sessionId, recent: dedupeRecords(anchors).slice(0, RECENT_ANCHORS_LIMIT) };
 		}
 
-		event.systemPromptOptions.sections["tape-notes"] = renderNotesBlock(anchorSnapshot.recent);
+		event.systemPromptOptions.sections["tape-memory"] = renderMemoryBlock(anchorSnapshot.recent);
 		const dream = dreamPromptSection();
 		if (dream) event.systemPromptOptions.sections["tape-dream"] = dream;
 	});
@@ -1651,20 +1670,28 @@ export default function (pi: ExtensionAPI) {
 		} catch { /* a broken dream state never interrupts the session */ }
 	};
 
+	// Due checks run at session start and whenever the agent settles.
+	const startDream = () => {
+		if (!noticeCtx) return;
+		void maybeStartDream(noticeCtx.mode, Date.now(), () => {
+			noticePending = true;
+			showNotice();
+		}).catch(() => {});
+	};
+
 	pi.on("session_start", (event, ctx) => {
 		dreamSessionStart();
 		if (ctx.mode !== "tui" || process.env[DREAM_ENV]) return;
 		noticeCtx = ctx;
-		if (event.reason !== "startup") return showNotice();
-		noticePending = true;
+		if (event.reason === "startup") noticePending = true;
 		showNotice();
-		void maybeStartDream(event.reason, ctx.mode, Date.now(), () => {
-			noticePending = true;
-			showNotice();
-		}).catch(() => {});
+		startDream();
 	});
 
-	pi.on("agent_settled", () => showNotice());
+	pi.on("agent_settled", () => {
+		showNotice();
+		startDream();
+	});
 	pi.on("agent_end", (event) => dreamAgentEnd(event.messages));
 	pi.on("session_shutdown", () => {
 		noticeCtx = undefined;

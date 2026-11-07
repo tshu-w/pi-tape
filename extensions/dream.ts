@@ -1,12 +1,12 @@
 /**
  * Dream — optional periodic memory consolidation.
  *
- * An interactive startup that finds a run due spawns a detached `pi -p`
- * with PI_TAPE_DREAM=1. In that process pi-tape extracts the anchors and
- * user messages recorded since the last successful run, injects the dream
- * prompt, restricts edits to notes.md, the global AGENTS.md, and global
- * skills, and backs up notes.md before its first edit (AGENTS.md and skills
- * are under version control). The next interactive startup shows the
+ * An interactive session that finds a run due, at its start or when it goes
+ * idle, spawns a detached `pi -p` with PI_TAPE_DREAM=1. In that process
+ * pi-tape extracts the anchors and user messages recorded since the last
+ * successful run, injects the dream prompt, restricts edits to the memory
+ * directory, and backs up each memory file before its first edit. The
+ * session that started the run, or the next interactive startup, shows the
  * result once as a display-only entry.
  */
 
@@ -20,7 +20,9 @@ import { Text } from "@earendil-works/pi-tui";
 
 export const DREAM_ENV = "PI_TAPE_DREAM";
 const ENTRY_TYPE = "tape-dream";
-const DAY_MS = 24 * 60 * 60 * 1000;
+const HOUR_MS = 60 * 60 * 1000;
+/** At most one due check per process per interval, so idle checks stay cheap. */
+const CHECK_INTERVAL_MS = HOUR_MS;
 const LOCK_STALE_MS = 2 * 60 * 60 * 1000;
 const RUNS_KEPT = 10;
 const FORWARDED_MESSAGE = /^\s*(?:<agent-[a-z-]+[\s>]|\[(?:notification|pi-agents)\])/;
@@ -29,8 +31,8 @@ const DREAM_REQUEST = "Run the tape dream now.";
 
 interface DreamSettings {
 	enabled: boolean;
-	intervalDays: number;
-	minAnchors: number;
+	minHours: number;
+	minMessages: number;
 	model?: string;
 }
 
@@ -52,6 +54,8 @@ interface DreamRun {
 interface DreamState {
 	lastAttempt?: string;
 	lastSuccess?: string;
+	/** Where counting starts before the first successful run, so messages accumulate across days. */
+	firstSince?: string;
 	lastRun?: DreamRun;
 }
 
@@ -83,8 +87,9 @@ function reportPath(id: string): string {
 	return path.join(dreamDir(), `${id}.md`);
 }
 
-function notesBackupPath(id: string): string {
-	return path.join(dreamDir(), `${id}.notes.md`);
+/** Backups of the memory files a run edited, by their path in the memory directory. */
+function backupDir(id: string): string {
+	return path.join(dreamDir(), id);
 }
 
 function statePath(): string {
@@ -103,8 +108,8 @@ export function readDreamSettings(): DreamSettings {
 	const s = section && typeof section === "object" ? section : {};
 	return {
 		enabled: s.enabled === true,
-		intervalDays: typeof s.intervalDays === "number" && s.intervalDays > 0 ? s.intervalDays : 3,
-		minAnchors: Number.isInteger(s.minAnchors) && s.minAnchors >= 0 ? s.minAnchors : 10,
+		minHours: typeof s.minHours === "number" && s.minHours > 0 ? s.minHours : 24,
+		minMessages: Number.isInteger(s.minMessages) && s.minMessages >= 0 ? s.minMessages : 30,
 		model: typeof s.model === "string" && s.model.trim() ? s.model.trim() : undefined,
 	};
 }
@@ -175,13 +180,13 @@ function newRunId(now: number): string {
 function pruneRuns(keep: number): void {
 	let ids: string[];
 	try {
-		ids = fs.readdirSync(dreamDir()).filter((name) => name.endsWith(".md") && !name.endsWith(".notes.md")).map((name) => name.slice(0, -3)).sort();
+		ids = fs.readdirSync(dreamDir()).filter((name) => name.endsWith(".md")).map((name) => name.slice(0, -3)).sort();
 	} catch {
 		return;
 	}
 	for (const id of ids.slice(0, Math.max(0, ids.length - keep))) {
 		fs.rmSync(reportPath(id), { force: true });
-		fs.rmSync(notesBackupPath(id), { force: true });
+		fs.rmSync(backupDir(id), { recursive: true, force: true });
 	}
 }
 
@@ -223,21 +228,40 @@ function anchorOf(entry: any): { name: string; summary: string } | undefined {
 	return anchor?.version === 1 && anchor.name && anchor.summary ? anchor : undefined;
 }
 
-async function countAnchorsSince(sinceMs: number, enough: number): Promise<number> {
+/** Per session file: bytes already scanned and the times of the user messages in them. */
+const userMessageTimes = new Map<string, { offset: number; times: number[] }>();
+
+/** Counts the user's own messages after sinceMs, reading only what each session file appended since the last count. */
+async function countUserMessagesSince(sinceMs: number, enough: number): Promise<number> {
 	let count = 0;
 	for (const file of sessionFilesModifiedAfter(sinceMs)) {
-		let raw: string;
+		let scanned = userMessageTimes.get(file);
 		try {
-			raw = await fs.promises.readFile(file, "utf-8");
+			const size = (await fs.promises.stat(file)).size;
+			if (!scanned || size < scanned.offset) scanned = { offset: 0, times: [] };
+			if (size > scanned.offset) {
+				const handle = await fs.promises.open(file, "r");
+				const buffer = Buffer.alloc(size - scanned.offset);
+				try {
+					await handle.read(buffer, 0, buffer.length, scanned.offset);
+				} finally {
+					await handle.close();
+				}
+				const complete = buffer.lastIndexOf(0x0a) + 1;
+				for (const line of buffer.subarray(0, complete).toString("utf-8").split("\n")) {
+					if (!line.includes('"user"')) continue;
+					let entry: any;
+					try { entry = JSON.parse(line); } catch { continue; }
+					if (userText(entry)) scanned.times.push(entryTime(entry));
+				}
+				scanned.offset += complete;
+			}
 		} catch {
 			continue;
 		}
-		for (const line of raw.split("\n")) {
-			if (!line.includes('"tapeAnchor"')) continue;
-			let entry: any;
-			try { entry = JSON.parse(line); } catch { continue; }
-			if (anchorOf(entry) && entryTime(entry) > sinceMs && ++count >= enough) return count;
-		}
+		userMessageTimes.set(file, scanned);
+		count += scanned.times.filter((time) => time > sinceMs).length;
+		if (count >= enough) return count;
 	}
 	return count;
 }
@@ -287,18 +311,23 @@ export function buildDreamInput(sinceMs: number, untilMs: number): { text: strin
 // Interactive side: trigger and notice
 // ============================================================================
 
+let lastCheck = Number.NEGATIVE_INFINITY;
+
 /**
  * Starts a detached dream run when one is due; resolves to the decision for diagnostics and tests.
  * `onExit` runs when the dream process ends while this process is still alive.
  */
-export async function maybeStartDream(reason: string, mode: string, now = Date.now(), onExit?: () => void): Promise<string> {
-	if (reason !== "startup" || mode !== "tui" || process.env[DREAM_ENV]) return "skip";
+export async function maybeStartDream(mode: string, now = Date.now(), onExit?: () => void): Promise<string> {
+	if (mode !== "tui" || process.env[DREAM_ENV]) return "skip";
 	const settings = readDreamSettings();
 	if (!settings.enabled) return "disabled";
 	const state = readState();
-	if (state.lastAttempt && now - Date.parse(state.lastAttempt) < settings.intervalDays * DAY_MS) return "not-due";
-	const since = state.lastSuccess ?? new Date(now - settings.intervalDays * DAY_MS).toISOString();
-	if (await countAnchorsSince(Date.parse(since), settings.minAnchors) < settings.minAnchors) return "too-few-anchors";
+	if (state.lastAttempt && now - Date.parse(state.lastAttempt) < settings.minHours * HOUR_MS) return "not-due";
+	if (now - lastCheck < CHECK_INTERVAL_MS) return "checked-recently";
+	lastCheck = now;
+	const since = state.lastSuccess ?? state.firstSince ?? new Date(now - settings.minHours * HOUR_MS).toISOString();
+	if (!state.lastSuccess && !state.firstSince) writeState({ ...state, firstSince: since });
+	if (await countUserMessagesSince(Date.parse(since), settings.minMessages) < settings.minMessages) return "too-few-messages";
 	if (!acquireLock(now)) return "locked";
 
 	const startedAt = new Date(now).toISOString();
@@ -342,19 +371,13 @@ function reasonFor(report: string, label: string): string | undefined {
 	return undefined;
 }
 
-function countDiffLines(diff: string, prefix: "+" | "-"): number {
-	return diff.split("\n").filter((line) => line.startsWith(prefix)).length;
-}
-
 function summarize(files: DreamFileChange[]): string {
 	if (files.length === 0) return "no changes";
 	const parts: string[] = [];
-	const notes = files.find((file) => file.label === "notes.md");
-	if (notes) parts.push(`notes ${notes.linesBefore}→${notes.linesAfter} lines`);
-	const skills = new Set(files.filter((file) => file.label.startsWith("skills/")).map((file) => file.label.split("/")[1]));
-	if (skills.size) parts.push(`${skills.size} skill${skills.size === 1 ? "" : "s"}`);
-	const agents = files.find((file) => file.label === "AGENTS.md");
-	if (agents) parts.push(`AGENTS.md +${countDiffLines(agents.diff, "+")} −${countDiffLines(agents.diff, "-")}`);
+	const index = files.find((file) => file.label === "MEMORY.md");
+	if (index) parts.push(`MEMORY.md ${index.linesBefore}→${index.linesAfter} lines`);
+	const topics = files.length - (index ? 1 : 0);
+	if (topics) parts.push(`${topics} topic file${topics === 1 ? "" : "s"}`);
 	return parts.join(" · ");
 }
 
@@ -444,23 +467,26 @@ function realTarget(file: string): string {
 	}
 }
 
-function memoryPaths(): { notes: string; agents: string; skills: string } {
-	const agentDir = getAgentDir();
-	return {
-		notes: path.join(agentDir, "tape", "notes.md"),
-		agents: path.join(agentDir, "AGENTS.md"),
-		skills: path.join(agentDir, "skills"),
-	};
+function memoryDir(): string {
+	return path.join(getAgentDir(), "tape", "memory");
 }
 
-/** The memory label of an editable path, or undefined when dream may not edit it. */
+/** A path's label relative to the memory directory, or undefined when dream may not edit it. */
 function editableLabel(target: string): string | undefined {
-	const paths = memoryPaths();
-	if (target === realTarget(paths.notes)) return "notes.md";
-	if (target === realTarget(paths.agents)) return "AGENTS.md";
-	const relative = path.relative(realTarget(paths.skills), target);
-	if (relative && relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative)) return `skills/${relative.split(path.sep).join("/")}`;
+	const relative = path.relative(realTarget(memoryDir()), target);
+	if (relative && relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative)) return relative.split(path.sep).join("/");
 	return undefined;
+}
+
+function memoryFiles(): string[] {
+	try {
+		return (fs.readdirSync(memoryDir(), { recursive: true, withFileTypes: true }) as fs.Dirent[])
+			.filter((dirent) => dirent.isFile())
+			.map((dirent) => path.relative(memoryDir(), path.join(dirent.parentPath, dirent.name)).split(path.sep).join("/"))
+			.sort();
+	} catch {
+		return [];
+	}
 }
 
 function readOptional(file: string): string | null {
@@ -487,14 +513,13 @@ export function dreamSessionStart(): void {
 
 export function dreamPromptSection(): string | undefined {
 	if (!activeRun) return undefined;
-	const paths = memoryPaths();
+	const files = memoryFiles();
 	const values: Record<string, string> = {
 		input: path.join(activeRun.inputDir, "input.md"),
 		since: activeRun.since,
 		until: activeRun.startedAt,
-		notes: paths.notes,
-		agents: paths.agents,
-		skills: paths.skills,
+		memory: memoryDir(),
+		files: files.length ? files.join(", ") : "none yet",
 	};
 	return fs.readFileSync(path.join(EXTENSION_DIR, "dream.md"), "utf-8").replace(/\{\{(\w+)\}\}/g, (match, key) => values[key] ?? match);
 }
@@ -511,12 +536,16 @@ export function dreamToolCall(event: { toolName: string; input: any }, ctx: { cw
 	const label = editableLabel(target);
 	if (!label) {
 		activeRun?.blocked.add(requested.startsWith(os.homedir()) ? `~${requested.slice(os.homedir().length)}` : requested);
-		return { block: true, reason: "A dream run may only edit notes.md, the global AGENTS.md, and files under the global skills directory." };
+		return { block: true, reason: `A dream run may only edit files in ${memoryDir()}.` };
 	}
 	if (activeRun && !activeRun.originals.has(target)) {
 		const content = readOptional(target);
 		activeRun.originals.set(target, { label, content });
-		if (label === "notes.md" && content !== null) fs.writeFileSync(notesBackupPath(activeRun.id), content);
+		if (content !== null) {
+			const backup = path.join(backupDir(activeRun.id), label);
+			fs.mkdirSync(path.dirname(backup), { recursive: true });
+			fs.writeFileSync(backup, content);
+		}
 	}
 	return undefined;
 }
@@ -537,7 +566,10 @@ export function dreamSessionShutdown(): void {
 	const files: DreamFileChange[] = [];
 	for (const [target, original] of run.originals) {
 		const current = readOptional(target);
-		if (current === original.content) continue;
+		if (current === original.content) {
+			fs.rmSync(path.join(backupDir(run.id), original.label), { force: true });
+			continue;
+		}
 		files.push({
 			label: original.label,
 			linesBefore: lineCount(original.content),
@@ -546,7 +578,9 @@ export function dreamSessionShutdown(): void {
 			reason: reasonFor(run.report ?? "", original.label),
 		});
 	}
-	if (!files.some((file) => file.label === "notes.md")) fs.rmSync(notesBackupPath(run.id), { force: true });
+	if (![...run.originals.values()].some((original) => original.content !== null && files.some((file) => file.label === original.label))) {
+		fs.rmSync(backupDir(run.id), { recursive: true, force: true });
+	}
 	fs.rmSync(run.inputDir, { recursive: true, force: true });
 	const finishedAt = new Date().toISOString();
 	const blocked = run.blocked.size ? [...run.blocked] : undefined;

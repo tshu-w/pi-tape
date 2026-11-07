@@ -68,7 +68,7 @@ test("custom session dir scans closed sessions and always includes the external 
 
 	const event = { systemPrompt: "SYS", systemPromptOptions: { sections: {} } };
 	await handlers.before_agent_start(event, ctx);
-	assert.match(event.systemPromptOptions.sections["tape-notes"], /recent anchors .*\[live-external-anchor\]/);
+	assert.match(event.systemPromptOptions.sections["tape-memory"], /recent anchors .*\[live-external-anchor\]/);
 });
 
 test("cross-session search body returns a complete sessionFile usable by view for duplicated fork IDs", async () => {

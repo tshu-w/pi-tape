@@ -1,4 +1,4 @@
-// Notes injection, budget, reminders, and the record index cache.
+// Memory index injection, its cap, and the record index cache.
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import * as fs from "node:fs";
@@ -18,16 +18,16 @@ const ctx = makeCtx({ cwd, sessionFile, branch });
 
 async function inject(context = ctx, hooks = handlers) {
 	const event = { type: "before_agent_start", prompt: "hi", systemPrompt: "SYS", systemPromptOptions: { sections: { other: "Unchanged" } } };
-	assert.equal(await hooks.before_agent_start(event, context), undefined, "notes must not force a full prompt replacement");
+	assert.equal(await hooks.before_agent_start(event, context), undefined, "memory must not force a full prompt replacement");
 	assert.equal(event.systemPromptOptions.sections.other, "Unchanged");
-	return event.systemPromptOptions.sections["tape-notes"];
+	return event.systemPromptOptions.sections["tape-memory"];
 }
 
-const globalNotes = path.join(agentDir, "tape", "notes.md");
+const memoryIndex = path.join(agentDir, "tape", "memory", "MEMORY.md");
 
-test("injection: pointers when no notes exist, anchors from past sessions", async () => {
+test("injection: pointers when no memory exists, anchors from past sessions", async () => {
 	const sp = await inject();
-	assert.ok(sp.includes(globalNotes));
+	assert.ok(sp.includes(memoryIndex));
 	assert.ok(sp.includes("recent anchors (cwd, session-start snapshot): [past-topic] 2026-07-01"));
 });
 
@@ -40,10 +40,10 @@ test("corrupt record index is rebuilt from session files", async () => {
 	assert.ok(sp.includes("[past-topic]"));
 });
 
-test("global notes follow the agent across cwd while anchor snapshots remain cwd scoped", async () => {
+test("memory follows the agent across cwd while anchor snapshots remain cwd scoped", async () => {
 	const content = "- shared preference\n- verified external fact\n";
-	fs.mkdirSync(path.dirname(globalNotes), { recursive: true });
-	fs.writeFileSync(globalNotes, content);
+	fs.mkdirSync(path.dirname(memoryIndex), { recursive: true });
+	fs.writeFileSync(memoryIndex, content);
 	for (const directory of [cwd, "/tmp/pi-tape-other-project"]) {
 		const { handlers: isolatedHandlers } = await loadTape();
 		const context = makeCtx({ cwd: directory, sessionId: directory, sessionDir: path.dirname(sessionFile) });
@@ -100,29 +100,28 @@ test("snapshot rescans when the session identity changes", async () => {
 	assert.match(next, /recent anchors \(cwd, session-start snapshot\): \[later-topic\] 2026-07-20 · \[past-topic\] 2026-07-01/);
 });
 
-test("soft budget warns only above 40 lines without truncating", async () => {
-	for (const count of [40, 41, 60, 80]) {
-		const content = Array.from({ length: count }, (_, i) => `- fact ${i}`).join("\n");
-		fs.writeFileSync(globalNotes, content);
-		const sp = await inject();
-		assert.equal(sp.includes("over budget"), count > 40);
-		assert.ok(sp.includes(content));
-		assert.doesNotMatch(sp, /distill required/);
-	}
-});
-
-test("hard line and byte limits bound injection without changing the global file", async () => {
+test("the index is cut at 100 lines or 10KB without changing the file", async () => {
 	for (const [content, lastRetained, firstOmitted] of [
-		[Array.from({ length: 81 }, (_, i) => `- bounded fact ${i}`).join("\n"), "- bounded fact 79", "- bounded fact 80"],
-		[Array.from({ length: 20 }, (_, i) => `- byte fact ${i} ${"中".repeat(500)}`).join("\n"), "- byte fact 4", "- byte fact 5"],
+		[Array.from({ length: 101 }, (_, i) => `- bounded fact ${i}`).join("\n"), "- bounded fact 99", "- bounded fact 100"],
+		[Array.from({ length: 20 }, (_, i) => `- byte fact ${i} ${"中".repeat(500)}`).join("\n"), "- byte fact 5", "- byte fact 6"],
 	]) {
-		fs.writeFileSync(globalNotes, content);
+		fs.writeFileSync(memoryIndex, content);
 		const sp = await inject();
 		assert.ok(sp.includes(lastRetained));
 		assert.ok(!sp.includes(firstOmitted));
-		assert.match(sp, /distill required/);
-		assert.equal(fs.readFileSync(globalNotes, "utf8"), content);
+		assert.match(sp, /MEMORY\.md is cut at 100 lines/);
+		assert.equal(fs.readFileSync(memoryIndex, "utf8"), content);
 	}
+});
+
+test("a write that leaves the index near its cap asks for a tidy-up", async () => {
+	const result = (toolName, file) => handlers.tool_result({ type: "tool_result", toolName, toolCallId: "w", input: { path: file }, content: [{ type: "text", text: "ok" }], isError: false }, ctx);
+	fs.writeFileSync(memoryIndex, Array.from({ length: 89 }, (_, i) => `- fact ${i}`).join("\n"));
+	assert.equal(await result("write", memoryIndex), undefined);
+	fs.writeFileSync(memoryIndex, Array.from({ length: 90 }, (_, i) => `- fact ${i}`).join("\n"));
+	const tidy = await result("edit", memoryIndex);
+	assert.deepEqual(tidy.content.map((part) => part.text.slice(0, 22)), ["ok", "MEMORY.md is at 90/100"]);
+	assert.equal(await result("write", path.join(path.dirname(memoryIndex), "topic.md")), undefined);
 });
 
 test("view defaults to session while scope=cwd lists records through the index", async () => {

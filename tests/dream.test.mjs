@@ -25,55 +25,61 @@ const entry = (id, time, message) => ({ type: "message", id, timestamp: iso(time
 const tui = { mode: "tui", isIdle: () => true };
 const writeSettings = (settings) => fs.writeFileSync(path.join(agentDir, "settings.json"), JSON.stringify({ "pi-tape": { dream: settings } }));
 
-test("dream starts only for a due interactive startup with enough new anchors", async () => {
-	const now = Date.now();
-	writeSettings({ enabled: false, minAnchors: 2 });
-	assert.equal(await dream.maybeStartDream("startup", "tui", now), "disabled");
+test("dream starts only when due, after enough messages the user typed", async () => {
+	const hour = 60 * 60_000;
+	// In the past, so the hourly check gate leaves later tests free to start a run.
+	const now = Date.now() - 3 * hour;
+	writeSettings({ enabled: false, minMessages: 2 });
+	assert.equal(await dream.maybeStartDream("tui", now), "disabled");
 
-	writeSettings({ enabled: true, minAnchors: 2 });
-	assert.equal(await dream.maybeStartDream("reload", "tui", now), "skip");
-	assert.equal(await dream.maybeStartDream("startup", "print", now), "skip");
+	writeSettings({ enabled: true, minMessages: 2 });
+	assert.equal(await dream.maybeStartDream("print", now), "skip");
 	process.env.PI_TAPE_DREAM = "1";
-	assert.equal(await dream.maybeStartDream("startup", "tui", now), "skip");
+	assert.equal(await dream.maybeStartDream("tui", now), "skip");
 	delete process.env.PI_TAPE_DREAM;
 
-	const anchors = [1, 2].map((n) => anchorEntry({ id: `anchor-${n}`, name: `a${n}`, summary: "s", cwd: "/work", createdAt: iso(now - n * 60_000) }));
-	writeSession(agentDir, "--work--", "work.jsonl", "/work", anchors.slice(0, 1));
-	assert.equal(await dream.maybeStartDream("startup", "tui", now), "too-few-anchors");
+	const typed = entry("typed-1", now - 2 * 60_000, textMessage("user", "first"));
+	const relayed = entry("relayed", now - 90_000, textMessage("user", '<agent-message name="main">relay</agent-message>'));
+	const file = writeSession(agentDir, "--work--", "work.jsonl", "/work", [typed, relayed]);
+	assert.equal(await dream.maybeStartDream("tui", now), "too-few-messages");
+	assert.equal(await dream.maybeStartDream("tui", now + 60_000), "checked-recently");
 
-	writeSession(agentDir, "--work--", "work.jsonl", "/work", anchors);
-	assert.equal(await dream.maybeStartDream("startup", "tui", now), "started");
+	fs.appendFileSync(file, `\n${JSON.stringify(entry("typed-2", now - 60_000, textMessage("user", "second")))}\n`);
+	assert.equal(await dream.maybeStartDream("tui", now + hour), "started");
 	assert.equal(spawned.length, 1);
 	assert.equal(spawned[0].options.env.PI_TAPE_DREAM, "1");
 	assert.equal(spawned[0].options.detached, true);
 	assert.ok(["-p", "--no-session", "--no-mcp"].every((arg) => spawned[0].args.includes(arg)));
-	assert.equal(spawned[0].args.includes("-ne"), false);
 	assert.equal(spawned[0].args.includes("--model"), false);
 	assert.ok(fs.existsSync(path.join(dreamDir, "lock")));
 	const { id } = JSON.parse(fs.readFileSync(path.join(dreamDir, "state.json"), "utf-8")).lastRun;
 	assert.match(id, /^\d{4}-\d{2}-\d{2}-\d{4}$/);
 	assert.ok(fs.existsSync(path.join(dreamDir, `${id}.md`)));
-	assert.equal(await dream.maybeStartDream("startup", "tui", now + 60_000), "not-due");
+	assert.equal(await dream.maybeStartDream("tui", now + 2 * hour), "not-due");
 });
 
 test("a dream run edits only memory files and the next startup shows its diff once", async () => {
-	const notes = path.join(agentDir, "tape", "notes.md");
-	fs.writeFileSync(notes, "- old\n");
+	const memory = path.join(agentDir, "tape", "memory");
+	const index = path.join(memory, "MEMORY.md");
+	fs.mkdirSync(memory, { recursive: true });
+	fs.writeFileSync(index, "- old\n");
+	fs.writeFileSync(path.join(memory, "kept.md"), "kept\n");
 	const ctx = { cwd: agentDir };
 	const call = (toolName, input) => handlers.tool_call({ type: "tool_call", toolName, toolCallId: "call", input }, ctx);
 
 	process.env.PI_TAPE_DREAM = "1";
 	try {
 		handlers.session_start({ type: "session_start", reason: "startup" }, { mode: "print" });
-		assert.equal(await call("edit", { path: "tape/notes.md" }), undefined);
-		assert.equal(await call("write", { path: path.join(agentDir, "skills", "dream-x", "SKILL.md") }), undefined);
-		assert.equal(await call("edit", { path: path.join(agentDir, "AGENTS.md") }), undefined);
-		for (const target of ["settings.json", "skills/../settings.json", "/tmp/elsewhere.md"]) {
+		assert.equal(await call("edit", { path: "tape/memory/MEMORY.md" }), undefined);
+		assert.equal(await call("edit", { path: path.join(memory, "kept.md") }), undefined);
+		assert.equal(await call("write", { path: path.join(memory, "topic.md") }), undefined);
+		for (const target of ["AGENTS.md", "skills/x/SKILL.md", "tape/memory/../notes.md", "/tmp/elsewhere.md"]) {
 			assert.equal((await call("edit", { path: target }))?.block, true, target);
 		}
 		assert.equal((await call("tape", { action: "anchor", name: "a", summary: "s" }))?.block, true);
-		fs.writeFileSync(notes, "- new\n");
-		handlers.agent_end({ type: "agent_end", messages: [{ role: "assistant", content: [{ type: "text", text: "## Changes\n- notes.md: merged" }] }] }, ctx);
+		fs.writeFileSync(index, "- new\n- see topic.md\n");
+		fs.writeFileSync(path.join(memory, "topic.md"), "details\n");
+		handlers.agent_end({ type: "agent_end", messages: [{ role: "assistant", content: [{ type: "text", text: "## Changes\n- MEMORY.md: merged" }] }] }, ctx);
 		handlers.session_shutdown({ type: "session_shutdown" }, ctx);
 	} finally {
 		delete process.env.PI_TAPE_DREAM;
@@ -82,19 +88,19 @@ test("a dream run edits only memory files and the next startup shows its diff on
 	const readState = () => JSON.parse(fs.readFileSync(path.join(dreamDir, "state.json"), "utf-8"));
 	const { lastRun, lastSuccess } = readState();
 	assert.equal(lastSuccess, lastRun.startedAt);
-	assert.deepEqual(fs.readdirSync(dreamDir).sort(), [`${lastRun.id}.md`, `${lastRun.id}.notes.md`, "state.json"]);
-	assert.equal(fs.readFileSync(path.join(dreamDir, `${lastRun.id}.notes.md`), "utf-8"), "- old\n");
+	assert.deepEqual(fs.readdirSync(path.join(dreamDir, lastRun.id)), ["MEMORY.md"]);
+	assert.equal(fs.readFileSync(path.join(dreamDir, lastRun.id, "MEMORY.md"), "utf-8"), "- old\n");
 
 	handlers.session_start({ type: "session_start", reason: "startup" }, tui);
 	handlers.session_start({ type: "session_start", reason: "startup" }, tui);
 	assert.equal(appended.length, 1);
-	assert.equal(appended[0].data.summary, "notes 1→1 lines");
-	assert.deepEqual(appended[0].data.files.map((file) => [file.label, file.reason]), [["notes.md", "merged"]]);
-	assert.deepEqual(appended[0].data.blocked, [path.join(agentDir, "settings.json"), "/tmp/elsewhere.md"]);
+	assert.equal(appended[0].data.summary, "MEMORY.md 1→2 lines · 1 topic file");
+	assert.deepEqual(appended[0].data.files.map((file) => [file.label, file.reason]), [["MEMORY.md", "merged"], ["topic.md", undefined]]);
+	assert.deepEqual(appended[0].data.blocked, ["AGENTS.md", "skills/x/SKILL.md", "tape/notes.md", "/tmp/elsewhere.md"].map((file) => file.startsWith("/") ? file : path.join(agentDir, file)));
 	initTheme("dark", false);
 	const theme = { bold: (text) => text, fg: (_color, text) => text };
 	const rendered = entryRenderers["tape-dream"](appended[0], { expanded: false }, theme).render(200).join("\n");
-	assert.ok(["notes 1→1 lines", "blocked: /tmp/elsewhere.md", "notes.md — merged", "- new"].every((text) => rendered.includes(text)), rendered);
+	assert.ok(["MEMORY.md 1→2 lines", "blocked: /tmp/elsewhere.md", "MEMORY.md — merged", "- new"].every((text) => rendered.includes(text)), rendered);
 	assert.equal(readState().lastRun.files, undefined);
 });
 
@@ -118,9 +124,9 @@ test("dream input keeps in-range anchors and user messages in full", () => {
 });
 
 test("a dream process that exits without a result is shown by the session that started it", async () => {
-	writeSettings({ enabled: true, minAnchors: 0 });
+	writeSettings({ enabled: true, minMessages: 0 });
 	const statePath = path.join(dreamDir, "state.json");
-	fs.writeFileSync(statePath, JSON.stringify({ lastAttempt: iso(Date.now() - 4 * 86_400_000) }));
+	fs.writeFileSync(statePath, JSON.stringify({ lastAttempt: iso(Date.now() - 2 * 86_400_000) }));
 	const shown = appended.length;
 	handlers.session_start({ type: "session_start", reason: "startup" }, tui);
 	for (let i = 0; i < 200 && spawned.length < 2; i++) await new Promise((resolve) => setTimeout(resolve, 10));
