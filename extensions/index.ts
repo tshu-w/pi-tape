@@ -56,6 +56,7 @@ import { withToolOutputContract } from "./tool-output.js";
 import {
 	DREAM_ENV,
 	dreamAgentEnd,
+	dreamAgentSettled,
 	dreamPromptSection,
 	dreamSessionShutdown,
 	dreamSessionStart,
@@ -1658,13 +1659,10 @@ export default function (pi: ExtensionAPI) {
 	// ── Dream: periodic memory consolidation (see dream.ts) ──────────
 	registerDreamRenderer(pi);
 
-	// A run that ends while an interactive session is open is shown there
-	// once the agent is idle; otherwise the next startup shows it.
+	// A finished run is shown once, by the first interactive session that is idle.
 	let noticeCtx: ExtensionContext | undefined;
-	let noticePending = false;
 	const showNotice = () => {
-		if (!noticePending || !noticeCtx?.isIdle()) return;
-		noticePending = false;
+		if (!noticeCtx?.isIdle()) return;
 		try {
 			showDreamNotice(pi);
 		} catch { /* a broken dream state never interrupts the session */ }
@@ -1673,22 +1671,19 @@ export default function (pi: ExtensionAPI) {
 	// Due checks run at session start and whenever the agent settles.
 	const startDream = () => {
 		if (!noticeCtx) return;
-		void maybeStartDream(noticeCtx.mode, Date.now(), () => {
-			noticePending = true;
-			showNotice();
-		}).catch(() => {});
+		void maybeStartDream(noticeCtx.mode, Date.now(), showNotice).catch(() => {});
 	};
 
-	pi.on("session_start", (event, ctx) => {
+	pi.on("session_start", (_event, ctx) => {
 		dreamSessionStart();
 		if (ctx.mode !== "tui" || process.env[DREAM_ENV]) return;
 		noticeCtx = ctx;
-		if (event.reason === "startup") noticePending = true;
 		showNotice();
 		startDream();
 	});
 
 	pi.on("agent_settled", () => {
+		dreamAgentSettled();
 		showNotice();
 		startDream();
 	});

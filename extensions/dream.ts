@@ -5,9 +5,9 @@
  * idle, spawns a detached `pi -p` with PI_TAPE_DREAM=1. In that process
  * pi-tape extracts the anchors and user messages recorded since the last
  * successful run, injects the dream prompt, restricts edits to the memory
- * directory, and backs up each memory file before its first edit. The
- * session that started the run, or the next interactive startup, shows the
- * result once as a display-only entry.
+ * directory, and backs up each memory file before its first edit. The first
+ * interactive session that is idle after the run ends shows the result once
+ * as a display-only entry.
  */
 
 import { spawn } from "node:child_process";
@@ -448,6 +448,8 @@ let activeRun: {
 	blocked: Set<string>;
 	report?: string;
 	error?: string;
+	/** Set once the agent run has settled, after any automatic retries. */
+	settled?: boolean;
 	originals: Map<string, { label: string; content: string | null }>;
 } | null = null;
 
@@ -553,16 +555,23 @@ export function dreamToolCall(event: { toolName: string; input: any }, ctx: { cw
 export function dreamAgentEnd(messages: any[]): void {
 	if (!activeRun) return;
 	const last = [...messages].reverse().find((message) => message?.role === "assistant");
-	if (last?.stopReason === "error" || last?.stopReason === "aborted") {
-		activeRun.error = last.errorMessage || `model run ${last.stopReason}`;
-	}
+	// A retry ends with another agent_end, so only the last attempt counts.
+	activeRun.error = last?.stopReason === "error" || last?.stopReason === "aborted"
+		? last.errorMessage || `model run ${last.stopReason}`
+		: undefined;
 	activeRun.report = (last?.content ?? []).filter((part: any) => part?.type === "text").map((part: any) => part.text).join("\n");
+}
+
+export function dreamAgentSettled(): void {
+	if (activeRun) activeRun.settled = true;
 }
 
 export function dreamSessionShutdown(): void {
 	if (!activeRun) return;
 	const run = activeRun;
 	activeRun = null;
+	// A shutdown before the run settled, e.g. on SIGTERM, interrupted it.
+	if (!run.settled) run.error = "the dream run was interrupted";
 	const files: DreamFileChange[] = [];
 	for (const [target, original] of run.originals) {
 		const current = readOptional(target);

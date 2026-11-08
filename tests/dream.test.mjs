@@ -79,7 +79,10 @@ test("a dream run edits only memory files and the next startup shows its diff on
 		assert.equal((await call("tape", { action: "anchor", name: "a", summary: "s" }))?.block, true);
 		fs.writeFileSync(index, "- new\n- see topic.md\n");
 		fs.writeFileSync(path.join(memory, "topic.md"), "details\n");
+		// A failed attempt that an automatic retry then completes.
+		handlers.agent_end({ type: "agent_end", messages: [{ role: "assistant", stopReason: "error", errorMessage: "overloaded", content: [] }] }, ctx);
 		handlers.agent_end({ type: "agent_end", messages: [{ role: "assistant", content: [{ type: "text", text: "## Changes\n- MEMORY.md: merged" }] }] }, ctx);
+		handlers.agent_settled({ type: "agent_settled" }, ctx);
 		handlers.session_shutdown({ type: "session_shutdown" }, ctx);
 	} finally {
 		delete process.env.PI_TAPE_DREAM;
@@ -102,6 +105,22 @@ test("a dream run edits only memory files and the next startup shows its diff on
 	const rendered = entryRenderers["tape-dream"](appended[0], { expanded: false }, theme).render(200).join("\n");
 	assert.ok(["MEMORY.md 1→2 lines", "blocked: /tmp/elsewhere.md", "MEMORY.md — merged", "- new"].every((text) => rendered.includes(text)), rendered);
 	assert.equal(readState().lastRun.files, undefined);
+});
+
+test("a dream run shut down before it settles fails as interrupted", () => {
+	const statePath = path.join(dreamDir, "state.json");
+	const { lastSuccess } = JSON.parse(fs.readFileSync(statePath, "utf-8"));
+	fs.writeFileSync(statePath, JSON.stringify({ lastSuccess, lastRun: { id: "interrupted", since: lastSuccess, startedAt: iso(Date.now()), noticed: false } }));
+	process.env.PI_TAPE_DREAM = "1";
+	try {
+		handlers.session_start({ type: "session_start", reason: "startup" }, { mode: "print" });
+		handlers.session_shutdown({ type: "session_shutdown" }, { cwd: agentDir });
+	} finally {
+		delete process.env.PI_TAPE_DREAM;
+	}
+	const state = JSON.parse(fs.readFileSync(statePath, "utf-8"));
+	assert.equal(state.lastSuccess, lastSuccess);
+	assert.match(state.lastRun.error, /interrupted/);
 });
 
 test("dream input keeps in-range anchors and user messages in full", () => {
