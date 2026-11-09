@@ -79,7 +79,7 @@ test("an omitted latest anchor restores the previous visible anchor for context 
 	assert.ok(preparation);
 	assert.match(preparation.messagesToSummarize[0].content, /summary — checkpoint/);
 	const { handlers } = await loadTape();
-	const result = await handlers.context({ messages: session.buildSessionContext().messages }, { sessionManager: session });
+	const result = await handlers.context_with_system({ messages: session.buildSessionContext().messages }, { sessionManager: session });
 	assert.ok(result);
 	assert.match(result.messages[0].content, /summary — checkpoint/);
 	assert.doesNotMatch(JSON.stringify(result.messages), /Omitted checkpoint/);
@@ -95,7 +95,7 @@ test("a newer native compaction supersedes an older anchor retained in its proje
 	assert.ok(projection.entries.some(({ sourceEntry, messages }) => sourceEntry.id === anchorId && messages.length > 0));
 	assert.equal(prepareProjectedAnchorCompaction(session.getBranch(), settings, 1000, fileOps), undefined);
 	const { handlers } = await loadTape();
-	assert.equal(await handlers.context({ messages: projection.messages }, { sessionManager: session }), undefined);
+	assert.equal(await handlers.context_with_system({ messages: projection.messages }, { sessionManager: session }), undefined);
 
 	const omittedAnchorId = session.appendMessage(anchorMessage({
 		name: "omitted-after-compact", summary: "Omitted checkpoint.", cwd: "/work",
@@ -103,7 +103,7 @@ test("a newer native compaction supersedes an older anchor retained in its proje
 	}));
 	session.appendContextEdit(omittedAnchorId, null);
 	assert.equal(prepareProjectedAnchorCompaction(session.getBranch(), settings, 1000, fileOps), undefined);
-	assert.equal(await handlers.context({ messages: session.buildSessionContext().messages }, { sessionManager: session }), undefined);
+	assert.equal(await handlers.context_with_system({ messages: session.buildSessionContext().messages }, { sessionManager: session }), undefined);
 });
 
 test("a new anchor after a multi-message checkpoint preserves the retained source ID", () => {
@@ -150,5 +150,5 @@ test("an omitted only anchor does not supply a compaction boundary", async () =>
 	session.appendContextEdit(anchorId, null);
 	assert.equal(prepareProjectedAnchorCompaction(session.getBranch(), settings, 1000, fileOps), undefined);
 	const { handlers } = await loadTape();
-	assert.equal(await handlers.context({ messages: session.buildSessionContext().messages }, { sessionManager: session }), undefined);
+	assert.equal(await handlers.context_with_system({ messages: session.buildSessionContext().messages }, { sessionManager: session }), undefined);
 });

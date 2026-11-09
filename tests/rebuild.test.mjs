@@ -2,7 +2,9 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import * as fs from "node:fs";
-import { getCurrentSystemPrompt, getCurrentTools } from "@earendil-works/pi-ai";
+import { isDeepStrictEqual } from "node:util";
+import { getCurrentSystemMessage, getCurrentSystemPrompt, getCurrentTools } from "@earendil-works/pi-ai";
+import { createExtensionRuntime, ExtensionRunner } from "@earendil-works/pi-coding-agent";
 import { anchorMessage, loadTape, makeAgentDir, textMessage } from "./harness.mjs";
 
 const agentDir = makeAgentDir();
@@ -14,8 +16,8 @@ const entriesForMessages = (messages) => messages.map((message, index) => ({
 	timestamp: new Date(message.timestamp ?? Date.now()).toISOString(),
 	message,
 }));
-const rebuild = (messages, branch = entriesForMessages(messages)) => handlers.context(
-	{ type: "context", messages },
+const rebuild = (messages, branch = entriesForMessages(messages)) => handlers.context_with_system(
+	{ type: "context_with_system", messages },
 	{ sessionManager: { getBranch: () => branch } },
 );
 
@@ -129,12 +131,17 @@ test("anchor trimming preserves system state and later tool deltas", async () =>
 	const afterCut = { role: "system", content: "", sections: { notes: "New notes" }, toolsRemoved: [{ name: "read" }], toolsAdded: [tool("edit")], timestamp: 3 };
 	const messages = [initial, beforeCut, ...longConversation(10), anchor("state", 2000), afterCut, textMessage("user", "continue")];
 	const original = structuredClone(messages);
-	const result = await rebuild(messages);
-	assert.ok(result);
+	// Through Pi's runner, so its handling of context hooks applies.
+	const runner = new ExtensionRunner(
+		[{ path: "pi-tape", handlers: new Map(Object.entries(handlers).map(([event, handler]) => [event, [handler]])) }],
+		createExtensionRuntime(), "/x", { getBranch: () => entriesForMessages(messages) }, undefined,
+	);
+	const result = { messages: await runner.emitContext(messages) };
+	assert.deepEqual(result.messages[0], getCurrentSystemMessage([initial, beforeCut]), "only deltas before the cut fold into the head");
 	assert.equal(result.messages[0].role, "system");
 	assert.deepEqual(getCurrentTools(result.messages), getCurrentTools(messages));
 	assert.equal(getCurrentSystemPrompt(result.messages), getCurrentSystemPrompt(messages));
-	assert.ok(result.messages.includes(afterCut), "retained deltas keep their position");
+	assert.ok(isDeepStrictEqual(result.messages.at(-2), afterCut), "retained deltas keep their position");
 	assert.deepEqual(messages, original, "projection must not mutate persisted history");
 	const repeated = await rebuild(result.messages, entriesForMessages(messages));
 	assert.deepEqual(getCurrentTools(repeated?.messages ?? result.messages), getCurrentTools(messages));

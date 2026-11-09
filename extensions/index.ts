@@ -1753,7 +1753,9 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	// ── Context hook: rebuild context from latest anchor ─────────────
-	pi.on("context", async (event, ctx) => {
+	// Runs on context_with_system so system patches after the cut stay in
+	// place; a plain context handler would let Pi fold them all into the head.
+	pi.on("context_with_system", async (event, ctx) => {
 		const messages = event.messages as any[];
 		if (!messages || messages.length === 0) return;
 
