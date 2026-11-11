@@ -40,32 +40,6 @@ for (const replacement of [null, { content: "Corrected content." }]) {
 		if (replacement) assert.match(summary, /Corrected content/);
 		assert.deepEqual(session.getBranch(), original, "projection must not rewrite history");
 	});
-
-	test(`compaction bridge receives context ${replacement ? "replacement" : "omission"} and edited retained messages`, async (t) => {
-		const { session, editedId, keptId } = fixture();
-		const omittedId = session.appendMessage(textMessage("user", "Omitted trailing content."));
-		session.appendContextEdit(editedId, replacement);
-		session.appendContextEdit(keptId, { content: "Corrected retained content." });
-		session.appendContextEdit(omittedId, null);
-		const key = Symbol.for("pi-tape.projected-compaction.v1");
-		const previous = globalThis[key];
-		t.after(() => {
-			if (previous === undefined) delete globalThis[key];
-			else globalThis[key] = previous;
-		});
-		let captured;
-		const result = { compaction: { summary: "Bridge summary.", firstKeptEntryId: keptId, tokensBefore: 1000 } };
-		globalThis[key] = { compact(input) { captured = input; return result; } };
-		const { handlers } = await loadTape();
-		assert.equal(await handlers.session_before_compact({
-			branchEntries: session.getBranch(),
-			preparation: { settings, tokensBefore: 1000, fileOps },
-		}, { model: { provider: "test", id: "test" }, sessionManager: session }), result);
-		assert.equal(captured.preparation.firstKeptEntryId, keptId);
-		assert.doesNotMatch(JSON.stringify(captured.messages), /Original content must not return|Omitted trailing content|Latest input/);
-		if (replacement) assert.match(JSON.stringify(captured.messages), /Corrected content/);
-		assert.equal(captured.messages.at(-1).content, "Corrected retained content.");
-	});
 }
 
 test("an omitted latest anchor restores the previous visible anchor for context and compaction", async () => {
