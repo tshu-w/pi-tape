@@ -1,146 +1,157 @@
-// Memory index injection, its cap, and the record index cache.
-import { test } from "node:test";
+// Memory requests use the SDK's actual branch projection and compaction checkpoints.
 import assert from "node:assert/strict";
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { anchorEntry, loadTape, makeAgentDir, makeCtx, writeSession } from "./harness.mjs";
+import test from "node:test";
+import { createJiti } from "jiti";
+import { SessionManager } from "@earendil-works/pi-coding-agent";
+import { collapseSystemMessages } from "@earendil-works/pi-ai/utils/transcript";
+import { makeAgentDir, textMessage } from "./harness.mjs";
 
 const agentDir = makeAgentDir();
-const cwd = "/tmp/pi-tape-fake-project";
-const { tools, handlers } = await loadTape();
+const index = path.join(agentDir, "tape", "memory", "MEMORY.md");
+const { createMemory } = await createJiti(import.meta.url).import("../extensions/memory.ts");
+const setIndex = (content) => {
+	fs.mkdirSync(path.dirname(index), { recursive: true });
+	fs.writeFileSync(index, content);
+};
 
-writeSession(agentDir, "--fake--", "past.jsonl", cwd, [
-	anchorEntry({ id: "aaaa1111-0000", name: "past-topic", summary: "Past work summary.", cwd, createdAt: "2026-07-01T10:00:00.000Z" }),
-]);
-const sessionFile = path.join(agentDir, "sessions", "--fake--", "current.jsonl");
-const branch = [];
-const ctx = makeCtx({ cwd, sessionFile, branch });
-
-async function inject(context = ctx, hooks = handlers) {
-	const event = { type: "before_agent_start", prompt: "hi", systemPrompt: "SYS", systemPromptOptions: { sections: { other: "Unchanged" } } };
-	assert.equal(await hooks.before_agent_start(event, context), undefined, "memory must not force a full prompt replacement");
-	assert.equal(event.systemPromptOptions.sections.other, "Unchanged");
-	return event.systemPromptOptions.sections["tape-memory"];
+function fixture(manager = SessionManager.inMemory("/work")) {
+	const memory = createMemory({ appendEntry: (type, data) => manager.appendCustomEntry(type, data) });
+	const ctx = { cwd: "/work", sessionManager: manager, model: { compat: { supportsMidConvoSystemMessages: true } } };
+	const before = () => {
+		const event = { systemPromptOptions: { sections: { other: "unchanged" } } };
+		assert.equal(memory.beforeAgentStart(event, ctx), undefined);
+		assert.equal(event.systemPromptOptions.sections.other, "unchanged");
+		return event.systemPromptOptions.sections.memory;
+	};
+	const request = () => memory.context(manager.buildSessionProjection().messages, ctx);
+	return { memory, manager, ctx, before, request };
 }
 
-const memoryIndex = path.join(agentDir, "tape", "memory", "MEMORY.md");
+function begin(content = "- original\n", manager) {
+	setIndex(content);
+	const f = fixture(manager);
+	const section = f.before();
+	f.manager.appendMessage({ role: "system", content: "SYS", sections: { memory: section, other: "stable" }, timestamp: 1 });
+	f.manager.appendMessage(textMessage("user", "task"));
+	return f;
+}
 
-test("injection: pointers when no memory exists, anchors from past sessions", async () => {
-	const sp = await inject();
-	assert.ok(sp.includes(memoryIndex));
-	assert.ok(sp.includes("recent anchors (cwd, session-start snapshot): [past-topic] 2026-07-01"));
+const body = (section) => section.split(">\n").slice(1).join(">\n").replace(/\n<\/memory>$/, "");
+
+test("the exact memory instructions use an empty index when MEMORY.md is absent", () => {
+	const f = fixture();
+	const section = f.before();
+	assert.equal(section, [
+		"Memory from past sessions: what you learned and should know without searching for it, such as the user's preferences and corrections, lasting facts and decisions, and where things live. It is shared by sessions in every project and on every machine.",
+		"Read a file in the memory directory when its index line matches the task. Update memory when you learn something worth keeping.",
+		"AGENTS.md takes precedence over memory.",
+		"",
+		`<memory path="${path.dirname(index)}">`, "", "</memory>",
+	].join("\n"));
 });
 
-test("corrupt record index is rebuilt from session files", async () => {
-	const indexFile = path.join(agentDir, "tape", "index.json");
-	// Corrupt index must be survivable (rebuilt from session files).
-	fs.writeFileSync(indexFile, "not json");
-	const fresh = await loadTape();
-	const sp = await inject(ctx, fresh.handlers);
-	assert.ok(sp.includes("[past-topic]"));
-});
-
-test("memory follows the agent across cwd while anchor snapshots remain cwd scoped", async () => {
-	const content = "- shared preference\n- verified external fact\n";
-	fs.mkdirSync(path.dirname(memoryIndex), { recursive: true });
-	fs.writeFileSync(memoryIndex, content);
-	for (const directory of [cwd, "/tmp/pi-tape-other-project"]) {
-		const { handlers: isolatedHandlers } = await loadTape();
-		const context = makeCtx({ cwd: directory, sessionId: directory, sessionDir: path.dirname(sessionFile) });
-		const sp = await inject(context, isolatedHandlers);
-		assert.ok(sp.includes(content.trimEnd()));
-		assert.equal(sp.includes("[past-topic]"), directory === cwd);
-	}
-});
-
-test("anchor result carries the summary; system prompt snapshot stays frozen", async () => {
-	const before = await inject();
-	const result = await tools.tape.execute("t2", { action: "anchor", name: "new-topic", summary: "Testing." }, undefined, undefined, ctx);
-	const text = result.content[0].text;
-	assert.ok(text.includes("Anchor created: new-topic"));
-	assert.ok(text.includes("Testing."));
-	assert.ok(!text.includes("recent anchors (this branch)"), "first anchor has no prior-anchor list");
-
-	branch.push({ type: "message", id: "bbbb2222-0000", timestamp: new Date().toISOString(), message: { role: "toolResult", toolName: "tape", content: result.content, details: result.details } });
-	const after = await inject();
-	assert.equal(after, before, "system prompt must be byte-identical after anchoring");
-	assert.ok(!after.includes("new-topic"));
-
-	const second = await tools.tape.execute("t3", { action: "anchor", name: "second-topic", summary: "More." }, undefined, undefined, ctx);
-	assert.match(second.content[0].text, /recent anchors \(this branch\): \[new-topic\] \d{4}-\d{2}-\d{2}/);
-	assert.ok(!second.content[0].text.includes("[second-topic]"), "current anchor is only in the title");
-});
-
-test("snapshot stays frozen when an ephemeral session first gets a file", async () => {
-	const { handlers: isolatedHandlers } = await loadTape();
-	const sessionId = "new-session-id";
-	const initialCtx = makeCtx({ cwd, sessionId, sessionFile: undefined, entries: [] });
-	const initial = await inject(initialCtx, isolatedHandlers);
-
-	const allocatedFile = writeSession(agentDir, "--fake--", "allocated.jsonl", cwd, [
-		anchorEntry({ id: "allocated-anchor", name: "created-mid-session", summary: "New work.", cwd, createdAt: "2026-07-19T10:00:00.000Z" }),
-	]);
-	const allocatedCtx = makeCtx({ cwd, sessionId, sessionFile: allocatedFile, entries: [] });
-	const afterAllocation = await inject(allocatedCtx, isolatedHandlers);
-	assert.equal(afterAllocation, initial);
-	assert.ok(!afterAllocation.includes("created-mid-session"));
-	fs.unlinkSync(allocatedFile);
-});
-
-test("snapshot rescans when the session identity changes", async () => {
-	writeSession(agentDir, "--fake--", "later.jsonl", cwd, [
-		anchorEntry({ id: "cccc3333-0000", name: "later-topic", summary: "Later work.", cwd, createdAt: "2026-07-20T10:00:00.000Z" }),
-	]);
-
-	const sameSession = await inject();
-	assert.ok(!sameSession.includes("later-topic"), "snapshot stays frozen within a session");
-
-	const otherCtx = makeCtx({ cwd, sessionFile: path.join(agentDir, "sessions", "--fake--", "next.jsonl") });
-	const next = await inject(otherCtx, handlers);
-	assert.match(next, /recent anchors \(cwd, session-start snapshot\): \[later-topic\] 2026-07-20 · \[past-topic\] 2026-07-01/);
-});
-
-test("the index is cut at 100 lines or 10KB without changing the file", async () => {
-	for (const [content, lastRetained, firstOmitted] of [
-		[Array.from({ length: 101 }, (_, i) => `- bounded fact ${i}`).join("\n"), "- bounded fact 99", "- bounded fact 100"],
-		[Array.from({ length: 20 }, (_, i) => `- byte fact ${i} ${"中".repeat(500)}`).join("\n"), "- byte fact 5", "- byte fact 6"],
+test("the index caps at 100 lines or 10KB without changing the file", () => {
+	for (const [content, last, omitted] of [
+		[Array.from({ length: 101 }, (_, i) => `fact ${i}`).join("\n"), "fact 99", "fact 100"],
+		[Array.from({ length: 20 }, (_, i) => `fact ${i} ${"中".repeat(500)}`).join("\n"), "fact 5", "fact 6"],
 	]) {
-		fs.writeFileSync(memoryIndex, content);
-		const sp = await inject();
-		assert.ok(sp.includes(lastRetained));
-		assert.ok(!sp.includes(firstOmitted));
-		assert.match(sp, /MEMORY\.md is cut at 100 lines/);
-		assert.equal(fs.readFileSync(memoryIndex, "utf8"), content);
+		setIndex(content);
+		const section = fixture().before();
+		assert.ok(section.includes(last));
+		assert.ok(!section.includes(omitted));
+		assert.match(section, /\[MEMORY\.md is cut at 100 lines\/10KB; the rest is not loaded\. Move details to other files\.\]/);
+		assert.equal(fs.readFileSync(index, "utf-8"), content);
+	}
+	setIndex("\n\n- leading blank lines\n");
+	assert.equal(body(fixture().before()), "\n\n- leading blank lines\n");
+});
+
+test("each request sees index changes at the tail while its entire cached prefix stays stable", () => {
+	const f = begin();
+	const initial = f.request();
+	setIndex("- revised\n");
+	const updated = f.request();
+	assert.deepEqual(updated.slice(0, initial.length), initial);
+	assert.equal(updated.length, initial.length + 1);
+	assert.match(updated.at(-1).sections.memory, /- revised/);
+	assert.equal(f.before(), initial[0]?.sections?.memory ?? initial.find((m) => m.role === "system").sections.memory);
+	f.manager.appendMessage(textMessage("assistant", "next turn", 2));
+	const next = f.request();
+	assert.deepEqual(next.slice(0, updated.length), updated);
+	assert.equal(next.at(-1).role, "assistant");
+	assert.deepEqual(f.memory.context(next, f.ctx), next, "request reconstruction is idempotent");
+});
+
+test("models without mid-conversation system support keep memory updates out of the collapsed head", () => {
+	for (const support of [false, undefined]) {
+		const f = begin();
+		f.ctx.model.compat.supportsMidConvoSystemMessages = support;
+		const initial = collapseSystemMessages({ messages: f.request() }).messages;
+		setIndex("- user-role update\n");
+		const updated = f.request();
+		assert.equal(updated.at(-1).role, "user");
+		assert.match(updated.at(-1).content, /- user-role update/);
+		assert.deepEqual(collapseSystemMessages({ messages: updated }).messages.slice(0, initial.length), initial);
+		const stored = f.manager.getBranch().findLast((entry) => entry.customType === "tape-memory").data;
+		assert.equal(stored.role, "user");
+		f.ctx.model.compat.supportsMidConvoSystemMessages = true;
+		assert.deepEqual(f.request(), updated, "switching models preserves the original update role");
+		const loaded = fixture(SessionManager.inMemory("/work", undefined, [f.manager.getHeader(), ...f.manager.getEntries()]));
+		assert.deepEqual(loaded.request(), updated, "reload preserves the original update role");
 	}
 });
 
-test("a write that leaves the index near its cap asks for a tidy-up", async () => {
-	const result = (toolName, file) => handlers.tool_result({ type: "tool_result", toolName, toolCallId: "w", input: { path: file }, content: [{ type: "text", text: "ok" }], isError: false }, ctx);
-	fs.writeFileSync(memoryIndex, Array.from({ length: 89 }, (_, i) => `- fact ${i}`).join("\n"));
-	assert.equal(await result("write", memoryIndex), undefined);
-	fs.writeFileSync(memoryIndex, Array.from({ length: 90 }, (_, i) => `- fact ${i}`).join("\n"));
-	const tidy = await result("edit", memoryIndex);
-	assert.deepEqual(tidy.content.map((part) => part.text.slice(0, 22)), ["ok", "MEMORY.md is at 90/100"]);
-	assert.equal(await result("write", path.join(path.dirname(memoryIndex), "topic.md")), undefined);
+test("reload and branch navigation replay only updates on their branch at their original positions", () => {
+	const manager = SessionManager.create("/work", path.join(agentDir, "sessions"));
+	const f = begin("- initial\n", manager);
+	f.request();
+	const forkPoint = manager.appendMessage(textMessage("assistant", "before edit", 3));
+	setIndex("- changed\n");
+	const updated = f.request();
+	manager.appendMessage(textMessage("assistant", "after edit", 4));
+	const expected = f.request();
+	assert.deepEqual(expected.slice(0, updated.length), updated);
+	const loaded = fixture(SessionManager.open(manager.getSessionFile()));
+	assert.deepEqual(loaded.request(), expected);
+	loaded.manager.branch(forkPoint);
+	setIndex("- initial\n");
+	const oldBranch = loaded.request();
+	assert.equal(oldBranch.filter((message) => message.role === "system" && message.sections?.memory?.includes("- changed")).length, 0);
 });
 
-test("view defaults to session while scope=cwd lists records through the index", async () => {
-	const currentAnchor = anchorEntry({
-		id: "dddd4444-0000",
-		name: "current-topic",
-		summary: "Current session summary.",
-		cwd,
-		createdAt: "2026-07-21T10:00:00.000Z",
-	});
-	const viewCtx = makeCtx({ cwd, sessionFile, branch: [currentAnchor] });
+test("compaction folds the current index into the head and stops replaying old updates", () => {
+	const f = begin();
+	f.request();
+	setIndex("- after update\n");
+	f.request();
+	const kept = f.manager.appendMessage(textMessage("user", "recent", 5));
+	f.manager.appendCompaction("summary", kept, 1000);
+	const section = f.before();
+	assert.match(section, /- after update/);
+	const compacted = f.request();
+	assert.match(compacted[0].sections.memory, /- after update/);
+	assert.equal(compacted.filter((message) => message.role === "system" && message.sections?.memory).length, 1);
+	setIndex("- after compaction\n");
+	const changed = f.request();
+	assert.deepEqual(changed.slice(0, compacted.length), compacted);
+	assert.match(changed.at(-1).sections.memory, /- after compaction/);
+});
 
-	const sessionView = await tools.tape.execute("t4", { action: "view" }, undefined, undefined, viewCtx);
-	assert.equal(sessionView.details.scope, "session");
-	assert.ok(sessionView.content[0].text.includes("current-topic"));
-	assert.ok(!sessionView.content[0].text.includes("past-topic"));
-
-	const cwdView = await tools.tape.execute("t5", { action: "view", scope: "cwd" }, undefined, undefined, viewCtx);
-	assert.ok(cwdView.content[0].text.includes("past-topic"));
+test("successful writes and edits at 90% of either cap append the exact notice", () => {
+	const f = fixture();
+	const result = (toolName, file = index, isError = false) => f.memory.toolResult({ toolName, input: { path: file }, content: [{ type: "text", text: "ok" }], isError }, f.ctx);
+	setIndex(Array.from({ length: 89 }, () => "fact").join("\n"));
+	assert.equal(result("write"), undefined);
+	setIndex(Array.from({ length: 90 }, () => "fact").join("\n"));
+	assert.equal(result("edit").content[1].text, "[MEMORY.md is at 90/100 lines, 0.4KB/10KB; lines past the cap are not loaded. Tidy the index: move details to other files.]");
+	assert.equal(result("write", index, true), undefined);
+	setIndex("x".repeat(9216));
+	assert.match(result("write").content[1].text, /1\/100 lines, 9\.0KB\/10KB/);
+	const topic = path.join(path.dirname(index), "topic.md");
+	fs.writeFileSync(topic, "topic");
+	assert.equal(result("write", topic), undefined);
 });
 
 test.after(() => fs.rmSync(agentDir, { recursive: true, force: true }));

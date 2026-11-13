@@ -2,7 +2,7 @@
 	"name": "pi-tape",
 	"version": "0.1.0",
 	"description": "Tape-style context management for pi sessions.",
-	"keywords": ["pi-package", "pi-extension", "context", "tape", "anchor"],
+	"keywords": ["pi-package", "pi-extension", "context", "tape", "compaction"],
 	"license": "AGPL-3.0-only",
 	"repository": "github:tshu-w/pi-tape",
 	"type": "module",
@@ -13,9 +13,9 @@
 		"extensions": ["./extensions"]
 	},
 	"peerDependencies": {
-		"@earendil-works/pi-coding-agent": ">=0.87.0",
+		"@earendil-works/pi-coding-agent": ">=1.0.0",
 		"@earendil-works/pi-agent-core": "*",
-		"@earendil-works/pi-ai": ">=0.87.0",
+		"@earendil-works/pi-ai": ">=1.0.0",
 		"@earendil-works/pi-tui": "*",
 		"typebox": "*"
 	},

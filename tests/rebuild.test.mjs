@@ -8,7 +8,9 @@ import { createExtensionRuntime, ExtensionRunner } from "@earendil-works/pi-codi
 import { anchorMessage, loadTape, makeAgentDir, textMessage } from "./harness.mjs";
 
 const agentDir = makeAgentDir();
-const { handlers } = await loadTape();
+const { createJiti } = await import("jiti");
+const { legacyContext } = await createJiti(import.meta.url).import("../extensions/legacy.ts");
+const handlers = { context_with_system(event, ctx) { const messages = legacyContext(event.messages, ctx.sessionManager.getBranch()); return messages === event.messages ? undefined : { messages }; } };
 const entriesForMessages = (messages) => messages.map((message, index) => ({
 	type: "message",
 	id: `message-${index}`,
@@ -145,13 +147,6 @@ test("anchor trimming preserves system state and later tool deltas", async () =>
 	assert.deepEqual(messages, original, "projection must not mutate persisted history");
 	const repeated = await rebuild(result.messages, entriesForMessages(messages));
 	assert.deepEqual(getCurrentTools(repeated?.messages ?? result.messages), getCurrentTools(messages));
-});
-
-test("nested anchor calls are blocked; direct calls and nested reads pass", async () => {
-	const anchor = { type: "tool_call", toolName: "tape", toolCallId: "call-1", input: { action: "anchor", name: "a", summary: "s" } };
-	assert.equal((await handlers.tool_call({ ...anchor, toolCallId: "call-1/1", parentToolCallId: "call-1" }))?.block, true);
-	assert.equal(await handlers.tool_call(anchor), undefined);
-	assert.equal(await handlers.tool_call({ ...anchor, input: { action: "search", query: "q" }, parentToolCallId: "call-1" }), undefined);
 });
 
 test.after(() => fs.rmSync(agentDir, { recursive: true, force: true }));

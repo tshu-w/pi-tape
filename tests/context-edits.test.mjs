@@ -5,6 +5,9 @@ import { anchorMessage, loadTape, loadTapeModule, makeAgentDir, textMessage } fr
 
 makeAgentDir();
 const { prepareProjectedAnchorCompaction } = await loadTapeModule();
+const { createJiti } = await import("jiti");
+const { legacyContext } = await createJiti(import.meta.url).import("../extensions/legacy.ts");
+async function loadLegacy() { return { handlers: { context_with_system(event, ctx) { const messages = legacyContext(event.messages, ctx.sessionManager.getBranch()); return messages === event.messages ? undefined : { messages }; } } }; }
 const settings = { enabled: true, reserveTokens: 1000, keepRecentTokens: 1 };
 const fileOps = { read: new Set(), written: new Set(), edited: new Set() };
 
@@ -52,7 +55,7 @@ test("an omitted latest anchor restores the previous visible anchor for context 
 	const preparation = prepareProjectedAnchorCompaction(session.getBranch(), settings, 1000, fileOps);
 	assert.ok(preparation);
 	assert.match(preparation.messagesToSummarize[0].content, /summary — checkpoint/);
-	const { handlers } = await loadTape();
+	const { handlers } = await loadLegacy();
 	const result = await handlers.context_with_system({ messages: session.buildSessionContext().messages }, { sessionManager: session });
 	assert.ok(result);
 	assert.match(result.messages[0].content, /summary — checkpoint/);
@@ -68,7 +71,7 @@ test("a newer native compaction supersedes an older anchor retained in its proje
 	assert.equal(projection.entries[0].messages.length, 2);
 	assert.ok(projection.entries.some(({ sourceEntry, messages }) => sourceEntry.id === anchorId && messages.length > 0));
 	assert.equal(prepareProjectedAnchorCompaction(session.getBranch(), settings, 1000, fileOps), undefined);
-	const { handlers } = await loadTape();
+	const { handlers } = await loadLegacy();
 	assert.equal(await handlers.context_with_system({ messages: projection.messages }, { sessionManager: session }), undefined);
 
 	const omittedAnchorId = session.appendMessage(anchorMessage({
@@ -119,10 +122,43 @@ test("context edits leave raw history search and view unchanged", async () => {
 	assert.match(view.content[0].text, /Original content must not return/);
 });
 
+test("search excludes only records whose searchable body remains in the effective projection", async () => {
+	const session = SessionManager.inMemory("/work");
+	const changedId = session.appendMessage(textMessage("user", "changed original marker"));
+	const sameId = session.appendMessage(textMessage("user", "same original marker"));
+	const call = (id, command) => ({ type: "toolCall", id, name: "bash", arguments: { command } });
+	const assistant = content => ({ role: "assistant", content, timestamp: Date.now(), stopReason: "toolUse" });
+	const unchangedTextId = session.appendMessage(assistant([{ type: "text", text: "retained text marker" }, call("original-call", "old-command-marker")]));
+	const unchangedCallId = session.appendMessage(assistant([{ type: "text", text: "old text marker" }, call("retained-call", "retained-command-marker")]));
+	session.appendContextEdit(changedId, { content: "different replacement marker" });
+	session.appendContextEdit(sameId, { content: "same original marker" });
+	session.appendContextEdit(unchangedTextId, { content: [{ type: "thinking", thinking: "new private metadata" }, { type: "text", text: "retained text marker" }, call("replacement-call", "new-command-marker")] });
+	session.appendContextEdit(unchangedCallId, { content: [{ type: "text", text: "new text marker" }, call("different-call-id", "retained-command-marker")] });
+	const before = structuredClone(session.getEntries());
+	const { tools } = await loadTape();
+	const ctx = { cwd: "/work", sessionManager: session };
+	const search = (query, kinds) => tools.tape.execute("search", { action: "search", query, kinds, scope: "branch" }, undefined, undefined, ctx);
+
+	assert.deepEqual((await search("changed original marker", ["message"])).details.results.map(item => item.entryId), [changedId]);
+	assert.equal((await search("same original marker", ["message"])).details.total, 0);
+	assert.equal((await search("retained text marker", ["message"])).details.total, 0);
+	assert.deepEqual((await search("old-command-marker", ["tool_call"])).details.results.map(item => item.entryId), [unchangedTextId]);
+	assert.deepEqual((await search("old text marker", ["message"])).details.results.map(item => item.entryId), [unchangedCallId]);
+	assert.equal((await search("retained-command-marker", ["tool_call"])).details.total, 0, "tool-call IDs do not change the searchable body");
+	assert.equal((await search("different replacement marker", ["message"])).details.total, 0, "search still reads raw history");
+	for (const entryId of [changedId, unchangedTextId, unchangedCallId]) {
+		const viewed = await tools.tape.execute("view", { action: "view", entryId }, undefined, undefined, ctx);
+		assert.match(viewed.content[0].text, /changed original marker|old-command-marker|old text marker/);
+		assert.doesNotMatch(viewed.content[0].text, /different replacement|new-command-marker|new text marker|new private metadata/);
+	}
+	assert.deepEqual(session.getEntries(), before);
+	assert.deepEqual(session.getBranch(), before);
+});
+
 test("an omitted only anchor does not supply a compaction boundary", async () => {
 	const { session, anchorId } = fixture();
 	session.appendContextEdit(anchorId, null);
 	assert.equal(prepareProjectedAnchorCompaction(session.getBranch(), settings, 1000, fileOps), undefined);
-	const { handlers } = await loadTape();
+	const { handlers } = await loadLegacy();
 	assert.equal(await handlers.context_with_system({ messages: session.buildSessionContext().messages }, { sessionManager: session }), undefined);
 });

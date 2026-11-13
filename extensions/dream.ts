@@ -3,7 +3,7 @@
  *
  * An interactive session that finds a run due, at its start or when it goes
  * idle, spawns a detached `pi -p` with PI_TAPE_DREAM=1. In that process
- * pi-tape extracts the anchors and user messages recorded since the last
+ * pi-tape extracts summaries and conversation entries recorded since the last
  * successful run, injects the dream prompt, restricts edits to the memory
  * directory, and backs up each memory file before its first edit. The first
  * interactive session that is idle after the run ends shows the result once
@@ -25,7 +25,6 @@ const HOUR_MS = 60 * 60 * 1000;
 const CHECK_INTERVAL_MS = HOUR_MS;
 const LOCK_STALE_MS = 2 * 60 * 60 * 1000;
 const RUNS_KEPT = 10;
-const FORWARDED_MESSAGE = /^\s*(?:<agent-[a-z-]+[\s>]|\[(?:notification|pi-agents)\])/;
 const EXTENSION_DIR = path.dirname(fileURLToPath(import.meta.url));
 const DREAM_REQUEST = "Run the tape dream now.";
 
@@ -46,8 +45,9 @@ interface DreamRun {
 	error?: string;
 	/** Kept until the notice is shown. */
 	files?: DreamFileChange[];
-	/** Paths whose edits the allowlist blocked. */
-	blocked?: string[];
+	suggestions?: string[];
+	indexLinesBefore?: number;
+	indexLinesAfter?: number;
 	noticed?: boolean;
 }
 
@@ -61,8 +61,6 @@ interface DreamState {
 
 interface DreamFileChange {
 	label: string;
-	linesBefore: number;
-	linesAfter: number;
 	diff: string;
 	reason?: string;
 }
@@ -71,7 +69,7 @@ interface DreamNotice {
 	summary: string;
 	error?: string;
 	files: Array<{ label: string; reason?: string; diff: string }>;
-	blocked?: string[];
+	suggestions?: string[];
 	report?: string;
 }
 
@@ -100,17 +98,39 @@ function lockPath(): string {
 	return path.join(dreamDir(), "lock");
 }
 
+let settingsWarnings: string[] = [];
+
+export function getDreamSettingsWarnings(): string[] {
+	readDreamSettings();
+	return settingsWarnings;
+}
+
 export function readDreamSettings(): DreamSettings {
+	settingsWarnings = [];
 	let section: any;
 	try {
 		section = JSON.parse(fs.readFileSync(path.join(getAgentDir(), "settings.json"), "utf-8"))?.["pi-tape"]?.dream;
-	} catch { /* defaults */ }
-	const s = section && typeof section === "object" ? section : {};
+	} catch { /* Pi handles unreadable settings. */ }
+	const defaults: DreamSettings = { enabled: false, minHours: 24, minMessages: 30 };
+	if (section === undefined) return defaults;
+	if (!section || typeof section !== "object" || Array.isArray(section)) {
+		settingsWarnings.push("Invalid pi-tape.dream; using defaults.");
+		return defaults;
+	}
+	const valid: Record<string, boolean> = {
+		enabled: typeof section.enabled === "boolean",
+		minHours: typeof section.minHours === "number" && Number.isFinite(section.minHours) && section.minHours > 0,
+		minMessages: Number.isInteger(section.minMessages) && section.minMessages >= 0,
+		model: section.model === null || (typeof section.model === "string" && /^[^/\s]+\/\S+$/.test(section.model)),
+	};
+	for (const key of Object.keys(valid)) {
+		if (section[key] !== undefined && !valid[key]) settingsWarnings.push(`Invalid pi-tape.dream.${key}; using default.`);
+	}
 	return {
-		enabled: s.enabled === true,
-		minHours: typeof s.minHours === "number" && s.minHours > 0 ? s.minHours : 24,
-		minMessages: Number.isInteger(s.minMessages) && s.minMessages >= 0 ? s.minMessages : 30,
-		model: typeof s.model === "string" && s.model.trim() ? s.model.trim() : undefined,
+		enabled: valid.enabled ? section.enabled : defaults.enabled,
+		minHours: valid.minHours ? section.minHours : defaults.minHours,
+		minMessages: valid.minMessages ? section.minMessages : defaults.minMessages,
+		model: valid.model && section.model !== null ? section.model : undefined,
 	};
 }
 
@@ -161,8 +181,8 @@ function acquireLock(now: number): boolean {
 	}
 }
 
-function releaseLock(): void {
-	fs.rmSync(lockPath(), { force: true });
+function releaseLock(id: string): void {
+	if (readState().lastRun?.id === id) fs.rmSync(lockPath(), { force: true });
 }
 
 /** Local start time to the minute; seconds and then a counter only to avoid a collision. */
@@ -222,12 +242,6 @@ function entryTime(entry: any): number {
 	return typeof raw === "number" ? raw : Date.parse(raw);
 }
 
-function anchorOf(entry: any): { name: string; summary: string } | undefined {
-	const message = entry?.type === "message" ? entry.message : undefined;
-	const anchor = message?.role === "toolResult" && message.toolName === "tape" ? message.details?.tapeAnchor : undefined;
-	return anchor?.version === 1 && anchor.name && anchor.summary ? anchor : undefined;
-}
-
 /** Per session file: bytes already scanned and the times of the user messages in them. */
 const userMessageTimes = new Map<string, { offset: number; times: number[] }>();
 
@@ -252,7 +266,7 @@ async function countUserMessagesSince(sinceMs: number, enough: number): Promise<
 					if (!line.includes('"user"')) continue;
 					let entry: any;
 					try { entry = JSON.parse(line); } catch { continue; }
-					if (userText(entry)) scanned.times.push(entryTime(entry));
+					if (entry?.type === "message" && entry.message?.role === "user") scanned.times.push(entryTime(entry));
 				}
 				scanned.offset += complete;
 			}
@@ -266,45 +280,62 @@ async function countUserMessagesSince(sinceMs: number, enough: number): Promise<
 	return count;
 }
 
-function userText(entry: any): string | undefined {
-	const message = entry?.type === "message" ? entry.message : undefined;
-	if (message?.role !== "user") return undefined;
-	const content = message.content;
-	const text = typeof content === "string"
-		? content
-		: Array.isArray(content) ? content.filter((part: any) => part?.type === "text").map((part: any) => part.text).join("\n") : "";
-	return text.trim() && !FORWARDED_MESSAGE.test(text) ? text.trim() : undefined;
+function messageText(message: any): string {
+	return typeof message?.content === "string" ? message.content
+		: (message?.content ?? []).filter((part: any) => part?.type === "text").map((part: any) => part.text).join("\n");
 }
 
-/** Anchor summaries and the user's own messages in (since, until], oldest first, in full. */
-export function buildDreamInput(sinceMs: number, untilMs: number): { text: string; anchors: number; messages: number } {
-	const items: Array<{ time: number; block: string; anchor: boolean }> = [];
+/** Latest summaries, full user messages, and later assistant entries in (since, until]. */
+export function buildDreamInput(sinceMs: number, untilMs: number): { text: string; summaries: number; messages: number; entries: number } {
+	const items: Array<{ time: number; block: string; kind: "summary" | "user" | "assistant" }> = [];
 	for (const file of sessionFilesModifiedAfter(sinceMs)) {
 		let raw: string;
 		try { raw = fs.readFileSync(file, "utf-8"); } catch { continue; }
+		const window: any[] = [];
 		for (const line of raw.split("\n")) {
-			if (!line.trim()) continue;
 			let entry: any;
 			try { entry = JSON.parse(line); } catch { continue; }
 			const time = entryTime(entry);
-			if (!(time > sinceMs && time <= untilMs)) continue;
-			const anchor = anchorOf(entry);
-			const text = anchor ? undefined : userText(entry);
-			if (!anchor && !text) continue;
-			const head = `## ${new Date(time).toISOString()} ${anchor ? `anchor ${anchor.name}` : "user"} · entryId=${entry.id} · sessionFile=${file}`;
-			items.push({ time, anchor: !!anchor, block: `${head}\n${anchor ? anchor.summary : text}\n` });
+			if (time > sinceMs && time <= untilMs) window.push(entry);
+		}
+		const latest = window.findLastIndex((entry) => entry.type === "compaction");
+		for (let index = 0; index < window.length; index++) {
+			const entry = window[index];
+			const message = entry.type === "message" ? entry.message : undefined;
+			let kind: "summary" | "user" | "assistant";
+			let text: string;
+			if (index === latest) {
+				kind = "summary";
+				text = entry.summary;
+			} else if (message?.role === "user") {
+				kind = "user";
+				text = messageText(message);
+			} else if (index > latest && message?.role === "assistant") {
+				kind = "assistant";
+				const fullText = messageText(message);
+				let excerpt = "";
+				for (const char of fullText) {
+					if (Buffer.byteLength(excerpt + char, "utf-8") > 600) break;
+					excerpt += char;
+				}
+				const calls = (message.content ?? []).filter((part: any) => part?.type === "toolCall")
+					.map((part: any) => `tool_call ${part.name} ${JSON.stringify(part.arguments)}`);
+				text = [excerpt, ...calls].filter(Boolean).join("\n");
+				if (!text) continue;
+			} else continue;
+			const time = entryTime(entry);
+			const head = `## ${new Date(time).toISOString()} ${kind} · entryId=${entry.id} · sessionFile=${file}`;
+			items.push({ time, kind, block: `${head}\n${text}\n` });
 		}
 	}
 	items.sort((a, b) => a.time - b.time);
-
-	const anchors = items.filter((item) => item.anchor).length;
-	const messages = items.length - anchors;
-	const header = [
-		"# Tape dream input",
+	const summaries = items.filter((item) => item.kind === "summary").length;
+	const messages = items.filter((item) => item.kind === "user").length;
+	const entries = items.length - summaries - messages;
+	const header = ["# Tape dream input",
 		`Range: ${new Date(sinceMs).toISOString()} → ${new Date(untilMs).toISOString()}`,
-		`Items: ${anchors} anchors, ${messages} user messages`,
-	].join("\n");
-	return { text: [header, ...items.map((item) => item.block)].join("\n\n"), anchors, messages };
+		`Items: ${summaries} summaries, ${messages} user messages, ${entries} entries`].join("\n");
+	return { text: [header, ...items.map((item) => item.block)].join("\n\n"), summaries, messages, entries };
 }
 
 // ============================================================================
@@ -337,7 +368,7 @@ export async function maybeStartDream(mode: string, now = Date.now(), onExit?: (
 
 	const fail = (error: unknown) => {
 		updateRun(id, { finishedAt: new Date().toISOString(), error: error instanceof Error ? error.message : String(error) });
-		releaseLock();
+		releaseLock(id);
 		onExit?.();
 	};
 	try {
@@ -366,19 +397,21 @@ export async function maybeStartDream(mode: string, now = Date.now(), onExit?: (
 function reasonFor(report: string, label: string): string | undefined {
 	for (const line of report.split("\n")) {
 		const match = line.match(/^\s*[-*]\s+`?([^`:]+)`?:\s*(.+)$/);
-		if (match && match[1].trim() === label) return match[2].trim().slice(0, 200);
+		if (match && match[1].trim() === label) return match[2].trim();
 	}
 	return undefined;
 }
 
-function summarize(files: DreamFileChange[]): string {
-	if (files.length === 0) return "no changes";
-	const parts: string[] = [];
-	const index = files.find((file) => file.label === "MEMORY.md");
-	if (index) parts.push(`MEMORY.md ${index.linesBefore}→${index.linesAfter} lines`);
-	const topics = files.length - (index ? 1 : 0);
-	if (topics) parts.push(`${topics} topic file${topics === 1 ? "" : "s"}`);
-	return parts.join(" · ");
+function summarize(files: DreamFileChange[], before: number, after: number): string {
+	if (files.length === 0) return "No changes";
+	const others = files.filter((file) => file.label !== "MEMORY.md").length;
+	return `MEMORY.md ${before}→${after} lines · ${others} other files`;
+}
+
+function suggestionsFor(report: string): string[] {
+	const section = report.match(/^## Suggestions\s*\n([\s\S]*?)(?=^## |$(?![\s\S]))/m)?.[1] ?? "";
+	return section.split("\n").filter((line) => /^\s*[-*]\s+/.test(line))
+		.map((line) => line.replace(/^\s*[-*]\s+/, "").trim());
 }
 
 function processAlive(pid: number): boolean {
@@ -403,34 +436,34 @@ export function showDreamNotice(pi: ExtensionAPI, now = Date.now()): void {
 	if (!run || run.noticed) return;
 	if (!run.finishedAt && (run.pid ? processAlive(run.pid) : lockIsFresh(now))) return;
 
-	const notice: DreamNotice = { summary: "", files: [], report: reportPath(run.id) };
+	const files = run.files ?? [];
+	const notice: DreamNotice = {
+		summary: summarize(files, run.indexLinesBefore ?? 0, run.indexLinesAfter ?? 0),
+		files: files.map(({ label, reason, diff }) => ({ label, reason, diff })),
+		suggestions: run.suggestions, report: reportPath(run.id),
+	};
 	if (!run.finishedAt) {
 		notice.error = reportTail(run.id) ?? "the dream process exited without a result";
-		releaseLock();
+		releaseLock(run.id);
 	} else if (run.error) {
 		notice.error = run.error;
-	} else {
-		const files = run.files ?? [];
-		notice.summary = summarize(files);
-		notice.files = files.map(({ label, reason, diff }) => ({ label, reason, diff }));
-		notice.blocked = run.blocked;
 	}
 	pi.appendEntry(ENTRY_TYPE, notice);
-	updateRun(run.id, { noticed: true, files: undefined, blocked: undefined, finishedAt: run.finishedAt ?? new Date(now).toISOString(), error: notice.error });
+	updateRun(run.id, { noticed: true, files: undefined, suggestions: undefined, finishedAt: run.finishedAt ?? new Date(now).toISOString(), error: notice.error });
 }
 
 export function registerDreamRenderer(pi: ExtensionAPI): void {
 	// Always expanded, like Pi's changelog: each file with its reason and full diff.
 	pi.registerEntryRenderer?.(ENTRY_TYPE, (entry, _options, theme) => {
 		const data = entry.data as DreamNotice;
-		if (data.error) return new Text(theme.fg("error", `tape dream failed: ${data.error}`), 1, 0);
-		const title = `${theme.bold("tape dream")} ${theme.fg("muted", `· ${data.summary}`)}`;
-		const lines = [title, ...(data.blocked ?? []).map((file) => theme.fg("warning", `blocked: ${file}`))];
-		if (data.files.length === 0) return new Text(lines.join("\n"), 1, 0);
+		const lines = [theme.fg("dim", "────────"), theme.bold("Dream"), "",
+			data.error ? theme.fg("error", `Failed: ${data.error}`) : data.summary];
 		for (const file of data.files) {
-			lines.push("", `${theme.bold(file.label)}${file.reason ? theme.fg("muted", ` — ${file.reason}`) : ""}`, renderDiff(file.diff));
+			lines.push("", `${file.label}${file.reason ? ` — ${file.reason}` : ""}`, renderDiff(file.diff));
 		}
+		if (data.suggestions?.length) lines.push("", theme.bold("Suggestions"), ...data.suggestions.map((line) => `- ${line}`));
 		if (data.report) lines.push("", theme.fg("dim", `report: ${data.report}`));
+		lines.push(theme.fg("dim", "────────"));
 		return new Text(lines.join("\n"), 1, 0);
 	});
 }
@@ -445,7 +478,7 @@ let activeRun: {
 	startedAt: string;
 	/** Temporary, removed when the run ends. */
 	inputDir: string;
-	blocked: Set<string>;
+	indexLinesBefore: number;
 	report?: string;
 	error?: string;
 	/** Set once the agent run has settled, after any automatic retries. */
@@ -454,19 +487,18 @@ let activeRun: {
 } | null = null;
 
 function realTarget(file: string): string {
-	let dir = file;
-	const rest: string[] = [];
-	while (!fs.existsSync(dir)) {
-		const parent = path.dirname(dir);
-		if (parent === dir) break;
-		rest.unshift(path.basename(dir));
-		dir = parent;
+	try {
+		return fs.realpathSync.native(file);
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
 	}
 	try {
-		return path.join(fs.realpathSync.native(dir), ...rest);
-	} catch {
-		return file;
+		return realTarget(path.resolve(path.dirname(file), fs.readlinkSync(file)));
+	} catch (error) {
+		if (!["ENOENT", "EINVAL"].includes((error as NodeJS.ErrnoException).code ?? "")) throw error;
 	}
+	const parent = path.dirname(file);
+	return parent === file ? file : path.join(realTarget(parent), path.basename(file));
 }
 
 function memoryDir(): string {
@@ -494,14 +526,15 @@ function memoryFiles(): string[] {
 function readOptional(file: string): string | null {
 	try {
 		return fs.readFileSync(file, "utf-8");
-	} catch {
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
 		return null;
 	}
 }
 
 function lineCount(content: string | null): number {
-	const trimmed = content?.trimEnd() ?? "";
-	return trimmed ? trimmed.split("\n").length : 0;
+	if (!content) return 0;
+	return content.split("\n").length - (content.endsWith("\n") ? 1 : 0);
 }
 
 export function dreamSessionStart(): void {
@@ -509,7 +542,7 @@ export function dreamSessionStart(): void {
 	const run = readState().lastRun;
 	if (!run || run.finishedAt) return;
 	const inputDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-tape-dream-"));
-	activeRun = { id: run.id, since: run.since, startedAt: run.startedAt, inputDir, blocked: new Set(), originals: new Map() };
+	activeRun = { id: run.id, since: run.since, startedAt: run.startedAt, inputDir, indexLinesBefore: lineCount(readOptional(path.join(memoryDir(), "MEMORY.md"))), originals: new Map() };
 	fs.writeFileSync(path.join(inputDir, "input.md"), buildDreamInput(Date.parse(run.since), Date.parse(run.startedAt)).text);
 }
 
@@ -528,26 +561,29 @@ export function dreamPromptSection(): string | undefined {
 
 export function dreamToolCall(event: { toolName: string; input: any }, ctx: { cwd: string }): { block: true; reason: string } | undefined {
 	if (!process.env[DREAM_ENV]) return undefined;
-	if (event.toolName === "tape" && event.input?.action === "anchor") {
-		return { block: true, reason: "A dream run cannot create anchors." };
+	if (event.toolName === "tape" && event.input?.action === "compact") {
+		return { block: true, reason: "A dream run cannot compact the context." };
+	}
+	if (!["read", "write", "edit", "tape"].includes(event.toolName)) {
+		return { block: true, reason: "A dream run may only use read, write, edit, and tape." };
 	}
 	if (event.toolName !== "edit" && event.toolName !== "write") return undefined;
+	if (!activeRun) return { block: true, reason: "No active dream run; memory edits cannot be backed up." };
 
 	const requested = path.resolve(ctx.cwd, String(event.input?.path ?? "").replace(/^~(?=$|\/)/, os.homedir()));
 	const target = realTarget(requested);
 	const label = editableLabel(target);
 	if (!label) {
-		activeRun?.blocked.add(requested.startsWith(os.homedir()) ? `~${requested.slice(os.homedir().length)}` : requested);
 		return { block: true, reason: `A dream run may only edit files in ${memoryDir()}.` };
 	}
 	if (activeRun && !activeRun.originals.has(target)) {
 		const content = readOptional(target);
-		activeRun.originals.set(target, { label, content });
 		if (content !== null) {
 			const backup = path.join(backupDir(activeRun.id), label);
 			fs.mkdirSync(path.dirname(backup), { recursive: true });
 			fs.writeFileSync(backup, content);
 		}
+		activeRun.originals.set(target, { label, content });
 	}
 	return undefined;
 }
@@ -556,7 +592,7 @@ export function dreamAgentEnd(messages: any[]): void {
 	if (!activeRun) return;
 	const last = [...messages].reverse().find((message) => message?.role === "assistant");
 	// A retry ends with another agent_end, so only the last attempt counts.
-	activeRun.error = last?.stopReason === "error" || last?.stopReason === "aborted"
+	activeRun.error = !last ? "the dream run ended without an assistant reply" : last?.stopReason === "error" || last?.stopReason === "aborted"
 		? last.errorMessage || `model run ${last.stopReason}`
 		: undefined;
 	activeRun.report = (last?.content ?? []).filter((part: any) => part?.type === "text").map((part: any) => part.text).join("\n");
@@ -581,8 +617,6 @@ export function dreamSessionShutdown(): void {
 		}
 		files.push({
 			label: original.label,
-			linesBefore: lineCount(original.content),
-			linesAfter: lineCount(current),
 			diff: generateDiffString(original.content ?? "", current ?? "").diff,
 			reason: reasonFor(run.report ?? "", original.label),
 		});
@@ -592,7 +626,8 @@ export function dreamSessionShutdown(): void {
 	}
 	fs.rmSync(run.inputDir, { recursive: true, force: true });
 	const finishedAt = new Date().toISOString();
-	const blocked = run.blocked.size ? [...run.blocked] : undefined;
-	updateRun(run.id, { finishedAt, error: run.error, files, blocked }, run.error ? {} : { lastSuccess: run.startedAt });
-	releaseLock();
+	updateRun(run.id, { finishedAt, error: run.error, files, suggestions: suggestionsFor(run.report ?? ""),
+		indexLinesBefore: run.indexLinesBefore, indexLinesAfter: lineCount(readOptional(path.join(memoryDir(), "MEMORY.md"))) },
+		run.error ? {} : { lastSuccess: run.startedAt });
+	releaseLock(run.id);
 }

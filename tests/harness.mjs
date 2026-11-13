@@ -23,7 +23,7 @@ export async function loadDreamModule() {
 }
 
 /** Load the extension with a mocked ExtensionAPI; returns registered surface. */
-export async function loadTape() {
+export async function loadTape(settings = {}) {
 	const factory = (await loadTapeModule()).default;
 	const tools = {};
 	const handlers = {};
@@ -33,6 +33,7 @@ export async function loadTape() {
 		registerTool: (tool) => { tools[tool.name] = tool; },
 		on: (event, handler) => { handlers[event] = handler; },
 		getThinkingLevel: () => "off",
+		getSettings: () => settings,
 		registerEntryRenderer: (customType, renderer) => { entryRenderers[customType] = renderer; },
 		appendEntry: (customType, data) => { appended.push({ customType, data }); },
 	});

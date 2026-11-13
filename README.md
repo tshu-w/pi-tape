@@ -1,11 +1,10 @@
 # pi-tape
 
-Context and memory for [Pi](https://pi.dev), built on the session [tape](https://tape.systems/): anchors keep context small, search recalls any session, and memory carries what matters into the next one.
+Context compaction, searchable history, and memory across sessions for [Pi](https://pi.dev).
 
-- **Anchors**: The model marks a topic boundary with a summary; from then on it sees the summary and recent messages, and older history stays searchable.
-- **Recall**: The model searches earlier messages and tool results across sessions and reads any entry with the messages around it.
-- **Memory**: The model keeps what future sessions need, such as your preferences, lasting project facts, and where things live. Its index loads into every session and details load on demand.
-- **Dream** (optional): Memory is consolidated in the background: duplicates merged, dated memories re-checked against later sessions, stale ones removed.
+- **Compaction**: Keep a summary and recent messages in context; older history stays searchable.
+- **Recall**: Search messages and tool results across sessions, and read entries with nearby conversation.
+- **Memory**: Keep preferences, lasting facts, and useful references across sessions. The model updates memory as it works; optional Dream runs review and consolidate it in the background.
 
 ## Install
 
@@ -13,21 +12,37 @@ Context and memory for [Pi](https://pi.dev), built on the session [tape](https:/
 pi install git:github.com/tshu-w/pi-tape
 ```
 
-Requires Pi 0.87.0 or later.
+Requires Pi 1.0.0 or later.
 
-## Dream
+## Compaction
 
-Enable it in the global `settings.json`:
+Context compacts automatically. The model can also request compaction with `tape(action='compact')`, or you can run `/compact`.
+
+Optionally set an end-of-turn token threshold in the global `settings.json`:
+
+```json
+"pi-tape": { "compactAt": 200000 }
+```
+
+Pi's compaction and retry settings also apply.
+
+## Memory
+
+Memory lives in `<agent-dir>/tape/memory/`. `MEMORY.md` is the index, loaded into every session; other files hold details that the model reads when needed. The model maintains these files with ordinary file tools during its work.
+
+### Dream
+
+Dream optionally reviews memory against past sessions and consolidates it in the background. Enable it in the global `settings.json`:
 
 ```json
 "pi-tape": { "dream": { "enabled": true, "minHours": 24, "minMessages": 30, "model": null } }
 ```
 
-It runs at most every `minHours` hours, once you have sent `minMessages` messages since the last run, and suggests changes to `AGENTS.md` and skills in its report. Reports and backups are kept in `<agent-dir>/tape/dream/`. The prompt is [`extensions/dream.md`](extensions/dream.md).
+It runs when both conditions are met: `minHours` since the last run started, and `minMessages` user messages since the last successful run. `model` selects a provider/modelId; null uses Pi's default model.
 
-## Limitations
+The notice shows memory changes and suggestions for other files, such as `AGENTS.md` and skills. Reports and backups are kept in `<agent-dir>/tape/dream/`. The prompt is [`extensions/dream.md`](extensions/dream.md).
 
-- While an anchor is active, compaction summarizes what the model sees, and other custom compaction handlers are unsupported.
+See the [specification](docs/SPEC.md) for the full behavior and configuration.
 
 ## License
 

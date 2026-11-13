@@ -2,7 +2,10 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { anchorEntry, loadTape, makeAgentDir, makeCtx, textMessage } from "./harness.mjs";
+import * as os from "node:os";
+import { createJiti } from "jiti";
+import { anchorEntry, makeAgentDir, makeCtx, textMessage } from "./harness.mjs";
+const { executeHistory } = await createJiti(import.meta.url).import("../extensions/history.ts");
 
 const agentDir = makeAgentDir();
 const cwd = "/tmp/pi-tape-custom-session-project";
@@ -54,7 +57,7 @@ const ctx = makeCtx({
 	branch: currentEntries,
 	entries: currentEntries,
 });
-const { tools, handlers } = await loadTape();
+const tools = { tape: { execute: (_id, params, signal, _update, context) => executeHistory(params, signal, context, { entryIds: new Set(), entries: [] }) } };
 
 test("custom session dir scans closed sessions and always includes the external current session", async () => {
 	const closed = await tools.tape.execute("s1", { action: "search", query: "closed custom", scope: "cwd" }, undefined, undefined, ctx);
@@ -63,12 +66,8 @@ test("custom session dir scans closed sessions and always includes the external 
 	const live = await tools.tape.execute("s2", { action: "search", query: "live external", scope: "all" }, undefined, undefined, ctx);
 	assert.equal(live.details.results[0].sessionFile, externalSessionFile);
 
-	const records = await tools.tape.execute("v1", { action: "view", scope: "all" }, undefined, undefined, ctx);
-	assert.match(records.content[0].text, /live-external-anchor/);
-
-	const event = { systemPrompt: "SYS", systemPromptOptions: { sections: {} } };
-	await handlers.before_agent_start(event, ctx);
-	assert.match(event.systemPromptOptions.sections["tape-memory"], /recent anchors .*\[live-external-anchor\]/);
+	const records = await tools.tape.execute("v1", { action: "search", kinds: ["compaction"], scope: "all" }, undefined, undefined, ctx);
+	assert.match(records.content[0].text, /Current external session anchor/);
 });
 
 test("cross-session search body returns a complete sessionFile usable by view for duplicated fork IDs", async () => {
@@ -101,6 +100,16 @@ test("view rejects session-shaped JSONL outside managed session locations", asyn
 		tools.tape.execute("v3", { action: "view", entryId: "untrusted-entry-id", sessionFile: untrustedFile }, undefined, undefined, ctx),
 		/configured session directories/,
 	);
+});
+
+test("view accepts the home-relative sessionFile printed by search", async () => {
+	const homeFile = path.join(os.homedir(), "pi-tape-history-test", "current.jsonl");
+	const context = makeCtx({ cwd, sessionFile: homeFile, branch: [duplicated] });
+	const search = await executeHistory({ action: "search", query: "fork", scope: "all" }, undefined, context, { entryIds: new Set(), entries: [] });
+	const printedFile = search.content[0].text.match(/sessionFile: (.+)/)[1];
+	assert.equal(printedFile, "~/pi-tape-history-test/current.jsonl");
+	const view = await executeHistory({ action: "view", entryId: duplicated.id, sessionFile: printedFile }, undefined, context, { entryIds: new Set(), entries: [] });
+	assert.match(view.content[0].text, /fork duplicated marker/);
 });
 
 test.after(() => fs.rmSync(agentDir, { recursive: true, force: true }));
